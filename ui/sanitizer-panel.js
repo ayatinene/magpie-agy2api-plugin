@@ -51,11 +51,12 @@
       "rules.reset": "恢复本地预设",
       "rules.resetConfirm": "确认恢复本地预设？",
       "rules.resetTip": "离线可用：4 个开关全部开启、侧载模式复位为关闭，并恢复内置 12 条推荐规则",
-      "rules.sync": "重置为 AGT beta 最新规则",
-      "rules.syncBusy": "正在拉取 AGT beta…",
-      "rules.syncTip": "联网拉取 AGT beta 最新推荐规则，并复位 4 个默认开关与侧载模式（默认关闭）",
+      "rules.sync": "拉取 Antigravity Tools 最新规则",
+      "rules.syncConfirm": "确认拉取并覆盖？",
+      "rules.syncBusy": "正在拉取 Antigravity Tools 规则…",
+      "rules.syncTip": "联网拉取 Antigravity Tools（beta 分支）最新推荐规则，替换当前规则，并复位 4 个默认开关与侧载模式（默认关闭）",
       "rules.syncUnavailable": "需通过 Magpie 服务代理访问以联网拉取",
-      "rules.limit": "{x}/{y} 已启用 · {n}/64",
+      "rules.limit": "已启用 {x}/{y} · 上限 {max}",
       "rules.empty": "暂无规则。可点击“添加规则”或恢复预设。",
       "rules.maxReached": "已达到 64 条上限",
       "rule.enable": "启用此规则",
@@ -85,9 +86,15 @@
       "foot.reverted": "已还原为上次保存的设置",
       "foot.rateLimited": "保存过于频繁，请稍后再试",
       "foot.failed": "保存失败，请重试",
-      "foot.loadFailed": "读取设置失败，已显示默认值",
-      "sync.ok": "已拉取 AGT beta 最新预设（{n} 条）并复位默认开关，请点击「保存并生效」",
-      "sync.fail": "拉取 AGT beta 规则失败：{err}（可点击「恢复本地预设」）",
+      "foot.loadFailed": "读取设置失败，当前显示默认值，暂时无法保存",
+      "foot.retry": "重试",
+      "foot.retryFailed": "重试失败，请稍后再试",
+      "foot.reloaded": "已读取设置",
+      "foot.reloadedDiscard": "已读取设置，读取失败期间的修改已丢弃",
+      "sync.ok": "已拉取 Antigravity Tools 最新规则（{n} 条）并复位默认开关，请点击「保存并生效」",
+      "sync.same": "已是 Antigravity Tools 最新规则（{n} 条），与已保存的设置一致，无需保存",
+      "sync.stale": "拉取期间设置有改动，已保留你的修改，未应用拉取结果",
+      "sync.fail": "拉取 Antigravity Tools 规则失败：{err}（可点击「恢复本地预设」）",
       "sync.unknownErr": "未知错误"
     },
     en: {
@@ -115,11 +122,12 @@
       "rules.reset": "Restore built-in",
       "rules.resetConfirm": "Confirm built-in reset?",
       "rules.resetTip": "Works offline: turns all 4 switches on, resets sideload to Off, and restores the bundled 12 preset rules",
-      "rules.sync": "Reset to latest AGT beta",
-      "rules.syncBusy": "Fetching AGT beta…",
-      "rules.syncTip": "Fetch the latest AGT beta preset rules online and reset default toggles (sideload Off)",
+      "rules.sync": "Fetch latest Antigravity Tools rules",
+      "rules.syncConfirm": "Confirm fetch and overwrite?",
+      "rules.syncBusy": "Fetching Antigravity Tools rules…",
+      "rules.syncTip": "Fetch the latest recommended Antigravity Tools rules (beta branch) online, replace the current rules, and reset the 4 default switches and sideload mode (Off)",
       "rules.syncUnavailable": "Requires Magpie page service to fetch upstream",
-      "rules.limit": "{x}/{y} on · {n}/64",
+      "rules.limit": "{x}/{y} enabled · limit {max}",
       "rules.empty": "No rules yet. Add one or reset to the recommended presets.",
       "rules.maxReached": "Reached the 64 rule limit",
       "rule.enable": "Enable this rule",
@@ -149,9 +157,15 @@
       "foot.reverted": "Reverted to last saved settings",
       "foot.rateLimited": "Saving too fast, please retry shortly",
       "foot.failed": "Save failed, please retry",
-      "foot.loadFailed": "Could not read settings; showing defaults",
-      "sync.ok": "Loaded {n} latest AGT beta presets & default toggles. Click Save to apply.",
-      "sync.fail": "Failed to fetch AGT beta presets: {err} (use \"Restore built-in defaults\")",
+      "foot.loadFailed": "Could not read settings. Showing defaults; saving is disabled.",
+      "foot.retry": "Retry",
+      "foot.retryFailed": "Retry failed. Please try again shortly.",
+      "foot.reloaded": "Settings loaded",
+      "foot.reloadedDiscard": "Settings loaded. Edits made before they could be read were discarded.",
+      "sync.ok": "Loaded {n} latest Antigravity Tools rules and reset the default switches. Click Save to apply.",
+      "sync.same": "Already matches the latest Antigravity Tools rules ({n} rules). Nothing to save.",
+      "sync.stale": "Settings changed while fetching. Your edits were kept and the fetched rules were not applied.",
+      "sync.fail": "Failed to fetch Antigravity Tools rules: {err} (you can use \"Restore built-in\")",
       "sync.unknownErr": "Unknown error"
     }
   };
@@ -172,6 +186,10 @@
   var statusVars = null;
   var statusTimer = 0;
   var syncing = false;
+  var syncArmed = false;
+  var syncTimer = 0;
+  var loadError = false;  // options.get() failed: defaults are shown, saving stays disabled
+  var loadingOpts = false;
   var idSeq = 0;
   var els = {};
 
@@ -463,6 +481,7 @@
     renderSync();
     els.save.textContent = saving ? t("foot.saving") : t("foot.save");
     els.revert.textContent = t("foot.revert");
+    els.retry.textContent = t("foot.retry");
     els.dirty.textContent = t("foot.dirty");
   }
 
@@ -495,7 +514,7 @@
     var enabled = 0;
     for (var i = 0; i < rules.length; i++) if (rules[i].enabled) enabled++;
     els.summary.textContent = t("rules.summary");
-    els.limit.textContent = t("rules.limit", { x: enabled, y: rules.length, n: rules.length });
+    els.limit.textContent = t("rules.limit", { x: enabled, y: rules.length, max: MAX_RULES });
     els.add.disabled = rules.length >= MAX_RULES;
     els.add.title = rules.length >= MAX_RULES ? t("rules.maxReached") : "";
     els.reset.textContent = resetArmed ? t("rules.resetConfirm") : t("rules.reset");
@@ -508,8 +527,9 @@
 
   function renderSync() {
     var hosted = window.__magpieServiceHosted === true;
-    els.sync.textContent = syncing ? t("rules.syncBusy") : t("rules.sync");
-    els.sync.disabled = !hosted || syncing;
+    els.sync.textContent = syncing ? t("rules.syncBusy") : (syncArmed ? t("rules.syncConfirm") : t("rules.sync"));
+    els.sync.classList.toggle("armed", syncArmed);
+    els.sync.disabled = !hosted || syncing || loadError;
     els.sync.title = hosted ? t("rules.syncTip") : t("rules.syncUnavailable");
     els.sync.setAttribute("aria-busy", syncing ? "true" : "false");
     els.reset.disabled = syncing;
@@ -521,9 +541,15 @@
     els.save.disabled = !dirty || saving;
     els.save.textContent = saving ? t("foot.saving") : t("foot.save");
     els.revert.disabled = !dirty || saving;
-    els.save.disabled = !dirty || saving || syncing;
-    els.status.textContent = statusKey ? t(statusKey, statusVars) : "";
-    els.status.className = "status" + (statusKind ? " " + statusKind : "");
+    els.save.disabled = !dirty || saving || syncing || loadError;
+    // a failed settings read stays visible until it succeeds; transient messages take precedence
+    var key = statusKey || (loadError ? "foot.loadFailed" : "");
+    var kind = statusKey ? statusKind : (loadError ? "err" : "");
+    els.status.textContent = key ? t(key, statusVars) : "";
+    els.status.className = "status" + (kind ? " " + kind : "");
+    els.retry.hidden = !loadError;
+    els.retry.disabled = loadingOpts;
+    els.retry.setAttribute("aria-busy", loadingOpts ? "true" : "false");
   }
 
   function mk(tag, cls, text) {
@@ -695,7 +721,16 @@
   /* ------------------------------------------------------------------ *
    * Actions
    * ------------------------------------------------------------------ */
+  function disarmSync() {
+    if (syncTimer) { clearTimeout(syncTimer); syncTimer = 0; }
+    if (syncArmed) {
+      syncArmed = false;
+      renderSummary();
+    }
+  }
+
   function disarmReset() {
+    disarmSync();
     if (resetTimer) { clearTimeout(resetTimer); resetTimer = 0; }
     if (resetArmed) {
       resetArmed = false;
@@ -810,6 +845,7 @@
 
   function onReset() {
     if (!resetArmed) {
+      disarmSync();
       resetArmed = true;
       renderSummary();
       resetTimer = setTimeout(function () {
@@ -841,15 +877,29 @@
   function syncFail(err) {
     syncing = false;
     renderSync();
+    renderFooter();
     setStatus("sync.fail", "err", true, { err: syncErrText(err) });
   }
 
   function onSync() {
-    if (syncing || saving || window.__magpieServiceHosted !== true) return;
-    disarmReset();
+    if (syncing || saving || loadError || window.__magpieServiceHosted !== true) return;
+    if (!syncArmed) {
+      disarmReset();
+      syncArmed = true;
+      renderSummary();
+      syncTimer = setTimeout(function () {
+        syncTimer = 0;
+        syncArmed = false;
+        renderSummary();
+      }, 4000);
+      return;
+    }
+    disarmReset();   // also clears the sync confirmation
     syncing = true;
+    var before = stateKey(draft);   // edits made while fetching must not be overwritten
     setStatus("", "");
     renderSync();
+    renderFooter();
     var req;
     try {
       req = fetch("api/upstream-presets", {
@@ -876,6 +926,12 @@
         if (isObj(data.rules[i])) rules.push(normRule(data.rules[i]));
       }
       if (!rules.length) throw new Error("empty rule list");
+      if (stateKey(draft) !== before) {
+        syncing = false;
+        renderSync();
+        setStatus("sync.stale", "err", true);
+        return;
+      }
       draft.promptSanitizer = true;
       draft.promptRewrite.enabled = true;
       draft.promptRewrite.normalize_identity = true;
@@ -887,7 +943,7 @@
       renderToggles();
       renderSummary();
       renderRules();
-      setStatus("sync.ok", "ok", true, { n: rules.length });
+      setStatus(isDirty() ? "sync.ok" : "sync.same", "ok", true, { n: rules.length });
     }).catch(syncFail);
   }
 
@@ -913,7 +969,7 @@
   }
 
   function onSave() {
-    if (saving || !isDirty()) return;
+    if (saving || loadError || !isDirty()) return;
     disarmReset();
     saving = true;
     setStatus("", "");
@@ -973,6 +1029,7 @@
     els.dirty = $("dirty");
     els.status = $("status");
     els.revert = $("btn-revert");
+    els.retry = $("btn-retry");
     els.save = $("btn-save");
 
     bindSegs(els.swMaster, "master");
@@ -994,6 +1051,32 @@
     els.list.addEventListener("change", onListInput);
     els.save.addEventListener("click", onSave);
     els.revert.addEventListener("click", onRevert);
+    els.retry.addEventListener("click", onRetry);
+  }
+
+  function readOptions() {
+    try { return Promise.resolve(window.magpie.options.get()); } catch (e) { return Promise.reject(e); }
+  }
+
+  /** Retry a failed settings read. A successful read replaces the draft (edits made on defaults are dropped). */
+  function onRetry() {
+    if (!loadError || loadingOpts) return;
+    loadingOpts = true;
+    renderFooter();
+    readOptions().then(function (opts) {
+      var edited = stateKey(draft) !== stateKey(saved);
+      loadingOpts = false;
+      loadError = false;
+      baseOptions = isObj(opts) ? opts : {};
+      saved = normalize(baseOptions);
+      draft = cloneState(saved);
+      renderAll();
+      setStatus(edited ? "foot.reloadedDiscard" : "foot.reloaded", "ok", true);
+    }, function () {
+      loadingOpts = false;
+      renderFooter();
+      setStatus("foot.retryFailed", "err", true);
+    });
   }
 
   function init() {
@@ -1001,12 +1084,12 @@
     var magpie = window.magpie;
     if (!magpie) {
       // Bridge missing: show defaults, editing stays local and unsaved.
+      loadError = true;   // no bridge: nothing can be read or saved
       baseOptions = {};
       saved = normalize({});
       draft = cloneState(saved);
       renderAll();
       showApp();
-      setStatus("foot.loadFailed", "err", false);
       return;
     }
 
@@ -1030,19 +1113,16 @@
           });
         }
       } catch (e) { /* ignore */ }
-      var loadFailed = false;
-      var loading;
-      try { loading = Promise.resolve(magpie.options.get()); } catch (e) { loading = Promise.reject(e); }
-      return loading.catch(function () { loadFailed = true; return {}; }).then(function (opts) {
+      return readOptions().catch(function () { loadError = true; return {}; }).then(function (opts) {
         baseOptions = isObj(opts) ? opts : {};
         saved = normalize(baseOptions);
         draft = cloneState(saved);
         renderAll();
         showApp();
-        if (loadFailed) setStatus("foot.loadFailed", "err", false);
       });
     }).catch(function () {
       if (!draft) {
+        loadError = true;
         baseOptions = {};
         saved = normalize({});
         draft = cloneState(saved);

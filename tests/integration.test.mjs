@@ -7,9 +7,11 @@ import { fileURLToPath } from "node:url";
 
 import { onProvider } from "../middleware.mjs";
 import { RECOMMENDED_PRESET_RULES, SIDELOAD_OPEN_TAG } from "../lib/sanitizer.mjs";
+import plugin from "../index.mjs";
+import { clearAdminSessionCache } from "../lib/auth.mjs";
 import { createAgy2ApiFetch, clearPrefixEffortCache } from "../lib/fetch.mjs";
 import { buildModelsFromRawEntries, clearModelCache, ensureModelsDiscovered } from "../lib/models.mjs";
-import { computeAgy2ApiUsage } from "../lib/quota.mjs";
+import { clearQuotaCache, computeAgy2ApiUsage } from "../lib/quota.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
@@ -86,6 +88,8 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
       parts: [{ text: "Help inspect the gateway module and explain its routing." }],
     };
 
+    const sanitizerOptions = { promptRewrite: { sideload_mode: "auto" } };
+
     // 1. Main agent turn with XHigh effort and normal output limit
     const mainRawBody = {
       systemInstruction: { role: "user", parts: [{ text: systemWithWaf }] },
@@ -97,7 +101,7 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
     };
     const mainSanitized = onProvider(mainRawBody, {
       ...makeCtx("gemini", "agy2api", "gemini-4-neon"),
-      options: { promptRewrite: { sideload_mode: "auto" } },
+      options: sanitizerOptions,
     });
     assert.ok(mainSanitized, "middleware should sanitize WAF/identity in main turn");
     assert.equal("systemInstruction" in mainSanitized, false, "sideload_mode auto should sideload >300B systemInstruction");
@@ -105,11 +109,12 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
     assert.ok(!mainSanitized.contents[0].parts[0].text.includes("x-anthropic-billing-header"));
     assert.ok(mainSanitized.contents[0].parts[0].text.includes("You are Antigravity"));
 
-    await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
+    const r1 = await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-magpie-effort": "xhigh" },
+      headers: { "content-type": "application/json", "x-magpie-effort": "xhigh", "x-session-id": "sess-main" },
       body: JSON.stringify(mainSanitized),
     });
+    await r1.json();
 
     assert.equal(captured.length, 1);
     assert.equal(captured[0].body.generationConfig.thinkingConfig.thinkingLevel, "xhigh");
@@ -129,18 +134,19 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
     };
     const auxSanitized = onProvider(auxRawBody, {
       ...makeCtx("gemini", "agy2api", "gemini-4-neon"),
-      options: { promptRewrite: { sideload_mode: "auto" } },
+      options: sanitizerOptions,
     });
     assert.ok(auxSanitized);
     // Verify zero prefix drift after sanitization + sideloading
     assert.equal(auxSanitized.systemInstruction, mainSanitized.systemInstruction);
     assert.deepEqual(auxSanitized.contents[0], mainSanitized.contents[0]);
 
-    await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
+    const r2 = await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-magpie-effort": "low" },
+      headers: { "content-type": "application/json", "x-magpie-effort": "low", "x-session-id": "sess-main" },
       body: JSON.stringify(auxSanitized),
     });
+    await r2.json();
 
     assert.equal(captured.length, 2);
     assert.equal(
@@ -149,58 +155,80 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
       "background memory extraction downgrade should restore XHigh effort",
     );
 
-    // 3. User actively switches main session to Low (full maxOutputTokens=65536) -> MUST take effect!
-    const userSwitchLowBody = {
+    // 3. User actively switches main session to Medium (full maxOutputTokens=65536, identical sanitizerOptions) -> MUST take effect!
+    const userSwitchMediumBody = {
       systemInstruction: { role: "user", parts: [{ text: systemWithWaf }] },
       contents: [
         firstUserTurn,
         { role: "model", parts: [{ text: "Sure, let's inspect the gateway." }] },
-        { role: "user", parts: [{ text: "Now summarize briefly with low effort." }] },
+        { role: "user", parts: [{ text: "Now summarize briefly with medium effort." }] },
       ],
       generationConfig: {
         maxOutputTokens: 65536,
-        thinkingConfig: { includeThoughts: true, thinkingLevel: "low" },
+        thinkingConfig: { includeThoughts: true, thinkingLevel: "medium" },
       },
     };
-    const switchSanitized = onProvider(userSwitchLowBody, makeCtx("gemini", "agy2api", "gemini-4-neon"));
-    await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
+    const switchSanitized = onProvider(userSwitchMediumBody, {
+      ...makeCtx("gemini", "agy2api", "gemini-4-neon"),
+      options: sanitizerOptions,
+    });
+    assert.deepEqual(switchSanitized.contents[0], mainSanitized.contents[0]);
+    const r3 = await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-magpie-effort": "low" },
+      headers: { "content-type": "application/json", "x-magpie-effort": "medium", "x-session-id": "sess-main" },
       body: JSON.stringify(switchSanitized),
     });
+    await r3.json();
 
     assert.equal(captured.length, 3);
     assert.equal(
       captured[2].body.generationConfig.thinkingConfig.thinkingLevel,
-      "low",
-      "explicit user switch to Low with normal output budget must take effect",
+      "medium",
+      "explicit user switch to Medium with normal output budget must take effect",
     );
 
-    // 4. Independent session (different first user turn) starting at Low -> stays Low
-    const independentBody = {
-      systemInstruction: { role: "user", parts: [{ text: systemWithWaf }] },
-      contents: [{ role: "user", parts: [{ text: "A totally separate session question." }] }],
-      generationConfig: {
-        maxOutputTokens: 4096,
-        thinkingConfig: { includeThoughts: true, thinkingLevel: "low" },
-      },
-    };
-    const indSanitized = onProvider(independentBody, makeCtx("gemini", "agy2api", "gemini-4-neon"));
-    await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
+    // 4. Subsequent Low aux call in same session aligns to updated Medium (NOT stale XHigh, NOT raw Low)
+    const r4 = await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-magpie-effort": "low" },
+      headers: { "content-type": "application/json", "x-magpie-effort": "low", "x-session-id": "sess-main" },
+      body: JSON.stringify(auxSanitized),
+    });
+    await r4.json();
+    assert.equal(captured.length, 4);
+    assert.equal(captured[3].body.generationConfig.thinkingConfig.thinkingLevel, "medium");
+
+    // 5. Independent session with identical first user turn & system but different session ID stays Low
+    const indSanitized = onProvider(
+      {
+        systemInstruction: { role: "user", parts: [{ text: systemWithWaf }] },
+        contents: [
+          firstUserTurn,
+          { role: "model", parts: [{ text: "Initial." }] },
+          { role: "user", parts: [{ text: "Extract." }] },
+        ],
+        generationConfig: {
+          maxOutputTokens: 4096,
+          thinkingConfig: { includeThoughts: true, thinkingLevel: "low" },
+        },
+      },
+      { ...makeCtx("gemini", "agy2api", "gemini-4-neon"), options: sanitizerOptions },
+    );
+    const r5 = await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-magpie-effort": "low", "x-session-id": "sess-other" },
       body: JSON.stringify(indSanitized),
     });
+    await r5.json();
 
-    assert.equal(captured.length, 4);
-    assert.equal(captured[3].body.generationConfig.thinkingConfig.thinkingLevel, "low");
+    assert.equal(captured.length, 5);
+    assert.equal(captured[4].body.generationConfig.thinkingConfig.thinkingLevel, "low");
   });
 
-  it("works end-to-end across Anthropic Messages protocol with sanitized system blocks and cache_control preserved", async () => {
+  it("works end-to-end across Anthropic Messages protocol with sanitized system blocks, format, and cache_control preserved", async () => {
     const captured = [];
     const mockFetch = async (url, init) => {
       captured.push({ url: String(url), body: JSON.parse(init.body) });
-      return new Response(JSON.stringify({ id: "msg_1" }), { status: 200 });
+      return new Response(JSON.stringify({ id: "msg_1", type: "message" }), { status: 200 });
     };
 
     const agyFetch = createAgy2ApiFetch({
@@ -237,7 +265,7 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
 
     await agyFetch("http://127.0.0.1:8017/v1/messages", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-magpie-effort": "high" },
+      headers: { "content-type": "application/json", "x-magpie-effort": "high", "x-session-id": "anth-sess-1" },
       body: JSON.stringify(mainSanitized),
     });
 
@@ -251,7 +279,7 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
         { role: "user", content: "Extract memory." },
       ],
       thinking: { type: "adaptive" },
-      output_config: { effort: "low" },
+      output_config: { effort: "low", format: { type: "json_schema", schema: { type: "object" } } },
     };
     const auxSanitized = onProvider(auxBody, {
       ...makeCtx("anthropic", "agy2api", "claude-opus-5-5"),
@@ -261,12 +289,160 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
     assert.deepEqual(auxSanitized.messages[0], mainSanitized.messages[0]);
     await agyFetch("http://127.0.0.1:8017/v1/messages", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-magpie-effort": "low" },
+      headers: { "content-type": "application/json", "x-magpie-effort": "low", "x-session-id": "anth-sess-1" },
       body: JSON.stringify(auxSanitized),
     });
 
     assert.equal(captured[0].body.output_config.effort, "high");
     assert.equal(captured[1].body.output_config.effort, "high");
+    assert.deepEqual(captured[1].body.output_config.format, {
+      type: "json_schema",
+      schema: { type: "object" },
+    });
+  });
+
+  it("composes config -> provider.models -> auth.loader -> chat.headers -> fetch -> auth.usage cleanly without page service", async () => {
+    clearAdminSessionCache();
+    clearModelCache();
+    clearQuotaCache();
+    clearPrefixEffortCache();
+
+    let uiFold = false;
+    let uiShowDetails = true;
+    const upstreamRequests = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      const u = new URL(url);
+      const headers = new Headers(init?.headers);
+      if (u.pathname === "/subpath/api/models") {
+        return new Response(
+          JSON.stringify({
+            models: [
+              {
+                id: "gemini-fixture",
+                name: "Gemini Fixture",
+                provider: "MODEL_PROVIDER_GOOGLE",
+                quota_group: "gemini",
+                thinking_levels: ["low", "high"],
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (u.pathname === "/subpath/api/accounts") {
+        return new Response(
+          JSON.stringify({
+            accounts: [
+              {
+                id: "fixture@example.com",
+                label: "Fixture",
+                state: "ready",
+                tier: "g1-pro-tier",
+                quota: [{ bucket_id: "gemini-5h", window: "5h", remaining_fraction: 0.75 }],
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (u.pathname === "/subpath/v1/messages") {
+        upstreamRequests.push({
+          url: String(url),
+          headers,
+          body: JSON.parse(init.body),
+        });
+        return new Response(JSON.stringify({ id: "msg_ok", type: "message" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected upstream URL: ${url}`);
+    };
+
+    try {
+      const hooks = await plugin.server(
+        {
+          magpie: {
+            options: () => ({
+              fold_effort_variants: uiFold,
+              show_account_details: uiShowDetails,
+              refresh_on_usage: false,
+            }),
+          },
+        },
+        { disablePageService: true, promptSanitizer: true },
+      );
+
+      const cfg = {
+        provider: {
+          agy2api: { api: "https://composed.example.invalid/subpath/v1beta" },
+        },
+      };
+      await hooks.config(cfg);
+
+      const modelsUnfolded = await hooks.provider.models(cfg.provider.agy2api, {
+        auth: { key: "sk-composed" },
+      });
+      assert.ok(modelsUnfolded["gemini-fixture"]);
+      assert.ok(modelsUnfolded["gemini-fixture-high"]);
+
+      const loaded = await hooks.auth.loader(
+        async () => ({ key: "sk-composed" }),
+        cfg.provider.agy2api,
+      );
+      assert.equal(loaded.baseURL, "https://composed.example.invalid/subpath");
+
+      const chatOut = { headers: {} };
+      await hooks["chat.headers"](
+        { model: { providerID: "agy2api" }, sessionID: "magpie-sess-99" },
+        chatOut,
+      );
+      assert.ok(chatOut.headers["x-agy2api-cache-session"]);
+
+      await loaded.fetch("https://composed.example.invalid/subpath/v1/messages", {
+        method: "POST",
+        headers: { ...chatOut.headers, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-opus-5-5",
+          max_tokens: 4096,
+          system: [
+            { type: "text", text: "x-anthropic-billing-header: cc_version=2.1;" },
+            { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+          ],
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      assert.equal(upstreamRequests.length, 1);
+      assert.equal(upstreamRequests[0].headers.get("x-agy2api-cache-session"), null);
+      assert.equal(
+        JSON.stringify(upstreamRequests[0].body).includes("x-anthropic-billing-header"),
+        false,
+      );
+      assert.equal(
+        JSON.stringify(upstreamRequests[0].body).includes("You are Antigravity"),
+        true,
+      );
+
+      uiFold = true;
+      uiShowDetails = false;
+      const modelsFolded = await hooks.provider.models(cfg.provider.agy2api, {
+        auth: { key: "sk-composed" },
+      });
+      assert.equal(modelsFolded["gemini-fixture-high"], undefined);
+
+      const usage = await hooks.auth.usage(
+        async () => ({ key: "sk-composed" }),
+        { ...cfg.provider.agy2api, models: modelsFolded },
+      );
+      assert.equal(usage.plan, "PRO ×1");
+      assert.equal(
+        usage.windows.some((w) => w.name.includes("Fixture · PRO")),
+        false,
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
   it("includes derived effort model IDs on folded base usage windows so effort-suffixed calls still match pool quota", () => {
@@ -396,7 +572,7 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
     assert.ok(!/https?:\/\/|localStorage|\beval\s*\(|\bimport\s|\bexport\s/.test(bridge), "bridge must be a classic script without external URLs/storage/eval");
     assert.ok(html.includes('id="btn-sync-upstream"') && html.includes('id="btn-reset"'));
     assert.ok(!/<script(?![^>]*\ssrc=)/i.test(html), "no inline scripts");
-    assert.ok(js.includes("重置为 AGT beta 最新规则") && js.includes("Reset to latest AGT beta"));
+    assert.ok(js.includes("拉取 Antigravity Tools 最新规则") && js.includes("Fetch latest Antigravity Tools rules"));
     assert.ok(js.includes("恢复本地预设") && js.includes("Restore built-in"));
     assert.ok(js.includes('"api/upstream-presets"') && js.includes("window.location.replace"));
 

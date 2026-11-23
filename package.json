@@ -51,7 +51,8 @@
       "preserveCacheEffort": true,
       "cacheTtlSec": 10,
       "refreshCooldownSec": 60,
-      "maxAccountDetails": 0
+      "maxAccountDetails": 0,
+      "pageServicePort": 18417
     }
   },
   "author": "ayatinene",
