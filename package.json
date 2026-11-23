@@ -21,6 +21,18 @@
     "name": "Antigravity2API",
     "middleware": "./middleware.mjs",
     "icon": "https://raw.githubusercontent.com/Mag1cFall/Antigravity2API/main/web/src/assets/logo.png",
+    "page": {
+      "title": "Prompt Sanitizer",
+      "titles": {
+        "zh": "风控提示词清洗"
+      },
+      "file": "ui/sanitizer-panel.html",
+      "icon": "ui/icon.svg",
+      "service": {
+        "port": 18417,
+        "option": "pageServicePort"
+      }
+    },
     "summary": {
       "en": "Antigravity2API provider plugin with cookie-authenticated admin discovery, shared/family pool quota deduplication, fault isolation, multi-protocol effort preservation, and prompt sanitization middleware with visual rule editor.",
       "zh": "Antigravity2API 专用插件：管理员会话认证、全动态模型发现、共享/家庭组配额去重、故障隔离规范化、全协议思考档位缓存对齐与可视化提示词清洗中间件。"

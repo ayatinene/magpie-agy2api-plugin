@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Antigravity2API · 风控提示词清洗</title>
+<link rel="stylesheet" href="sanitizer-panel.css">
+<script src="_magpie/bridge.js"></script>
+<script src="sanitizer-panel.js" defer></script>
+</head>
+<body>
+<main id="app" class="view" hidden>
+
+  <div class="row-head"><span class="label" data-i18n="sec.sanitizer"></span></div>
+
+  <div class="list prefs" id="settings">
+    <div class="row pref master" data-i18n-title="page.sub">
+      <div class="who">
+        <div class="name" id="lbl-master" data-i18n="master.title"></div>
+        <div class="sub sr-only" data-i18n="page.sub"></div>
+        <div class="sub warn" id="inactive-note" role="status" hidden data-i18n="master.inactive"></div>
+      </div>
+      <div class="segs" role="radiogroup" aria-labelledby="lbl-master" id="sw-master" data-on="true">
+        <span class="thumb" aria-hidden="true"></span>
+        <button class="opt" type="button" role="radio" data-val="off" aria-checked="false" data-i18n="seg.off"></button>
+        <button class="opt on" type="button" role="radio" data-val="on" aria-checked="true" data-i18n="seg.on"></button>
+      </div>
+    </div>
+    <div id="subs" class="subs">
+      <div class="row pref child" data-i18n-title="identity.desc">
+        <div class="who">
+          <div class="name" id="lbl-identity" data-i18n="identity.title"></div>
+          <div class="sub sr-only" data-i18n="identity.desc"></div>
+        </div>
+        <div class="segs" role="radiogroup" aria-labelledby="lbl-identity" id="sw-identity" data-on="true">
+        <span class="thumb" aria-hidden="true"></span>
+        <button class="opt" type="button" role="radio" data-val="off" aria-checked="false" data-i18n="seg.off"></button>
+        <button class="opt on" type="button" role="radio" data-val="on" aria-checked="true" data-i18n="seg.on"></button>
+      </div>
+      </div>
+      <div class="row pref child" id="row-sideload" data-i18n-title="sideload.desc">
+        <div class="who">
+          <div class="name" id="lbl-sideload" data-i18n="sideload.title"></div>
+          <div class="sub sr-only" data-i18n="sideload.desc"></div>
+        </div>
+        <div class="segs" role="radiogroup" aria-labelledby="lbl-sideload" id="sw-sideload" data-val="off">
+          <span class="thumb" aria-hidden="true"></span>
+          <button class="opt on" type="button" role="radio" data-val="off" aria-checked="true" data-i18n="sideload.off"></button>
+          <button class="opt" type="button" role="radio" data-val="auto" aria-checked="false" data-i18n="sideload.auto"></button>
+          <button class="opt" type="button" role="radio" data-val="always" aria-checked="false" data-i18n="sideload.always"></button>
+        </div>
+      </div>
+      <div class="row pref child" data-i18n-title="tools.desc">
+        <div class="who">
+          <div class="name" id="lbl-tools" data-i18n="tools.title"></div>
+          <div class="sub sr-only" data-i18n="tools.desc"></div>
+        </div>
+        <div class="segs" role="radiogroup" aria-labelledby="lbl-tools" id="sw-tools" data-on="true">
+        <span class="thumb" aria-hidden="true"></span>
+        <button class="opt" type="button" role="radio" data-val="off" aria-checked="false" data-i18n="seg.off"></button>
+        <button class="opt on" type="button" role="radio" data-val="on" aria-checked="true" data-i18n="seg.on"></button>
+      </div>
+      </div>
+      <div class="row pref child" data-i18n-title="rewrite.desc">
+        <div class="who">
+          <div class="name" id="lbl-rewrite" data-i18n="rewrite.title"></div>
+          <div class="sub sr-only" data-i18n="rewrite.desc"></div>
+        </div>
+        <div class="segs" role="radiogroup" aria-labelledby="lbl-rewrite" id="sw-rewrite" data-on="true">
+        <span class="thumb" aria-hidden="true"></span>
+        <button class="opt" type="button" role="radio" data-val="off" aria-checked="false" data-i18n="seg.off"></button>
+        <button class="opt on" type="button" role="radio" data-val="on" aria-checked="true" data-i18n="seg.on"></button>
+      </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row-head rules-head">
+    <button type="button" class="fold" id="rules-toggle" aria-expanded="true" aria-controls="rules-body">
+      <span class="label" id="rules-summary"></span>
+      <span class="count" id="rules-limit"></span>
+      <svg class="chev" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true" focusable="false"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <span class="grow"></span>
+    <button type="button" class="text" id="btn-reset"></button>
+    <button type="button" class="text" id="btn-sync-upstream"></button>
+    <button type="button" class="text" id="btn-add"></button>
+  </div>
+
+  <div id="rules-body">
+    <div class="list rules" id="rules-list" role="list"></div>
+    <p class="foot-note" id="rules-note"></p>
+  </div>
+
+  <div class="savebar" id="footer">
+    <span class="dirty" id="dirty" hidden></span>
+    <span class="status" id="status" role="status" aria-live="polite"></span>
+    <span class="grow"></span>
+    <button type="button" class="text" id="btn-revert" disabled></button>
+    <button type="button" class="text primary" id="btn-save" disabled></button>
+  </div>
+
+</main>
+</body>
+</html>

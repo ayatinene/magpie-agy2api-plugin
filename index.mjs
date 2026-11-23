@@ -7,6 +7,7 @@ import {
 } from "./lib/models.mjs";
 import { getAgy2ApiUsage } from "./lib/quota.mjs";
 import { createAgy2ApiFetch } from "./lib/fetch.mjs";
+import { DEFAULT_PAGE_SERVICE_PORT, startPageService } from "./lib/page-service.mjs";
 
 export const OFFICIAL_ICON_URL =
   "https://raw.githubusercontent.com/Mag1cFall/Antigravity2API/main/web/src/assets/logo.png";
@@ -76,6 +77,15 @@ function readLiveOptions(input, staticOptions) {
 }
 
 async function server(input, options) {
+  if (options?.disablePageService !== true) {
+    const rawPort = Number(options?.pageServicePort);
+    const port =
+      Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535
+        ? rawPort
+        : DEFAULT_PAGE_SERVICE_PORT;
+    void startPageService({ port }).catch(() => {});
+  }
+
   return {
     async config(cfg) {
       cfg.provider ??= {};
