@@ -1665,3 +1665,176 @@ describe("Stealth System Prompt Sideload (sideload_mode)", () => {
     assert.equal(stage3.contents[2].parts[0].text, "那我们采用方式一继续修改吧\n");
   });
 });
+
+describe("Tool results and call-only turns survive (chat)", () => {
+  it("keeps an empty tool result so its call is still answered", () => {
+    const out = onProvider(
+      {
+        messages: [
+          { role: "system", content: "You are opencode, an interactive CLI tool." },
+          { role: "user", content: "create the dir" },
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [{ id: "c1", type: "function", function: { name: "bash", arguments: "{}" } }],
+          },
+          { role: "tool", tool_call_id: "c1", content: "" },
+          { role: "assistant", content: "done" },
+        ],
+      },
+      makeAgyCtx("chat"),
+    );
+    assert.deepEqual(
+      out.messages.map((m) => m.role),
+      ["system", "user", "assistant", "tool", "assistant"],
+    );
+    assert.deepEqual(out.messages[3], { role: "tool", tool_call_id: "c1", content: "" });
+  });
+
+  it("leaves a request alone when the only empty content is a tool result", () => {
+    const body = {
+      messages: [
+        { role: "user", content: "create the dir" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "c1", type: "function", function: { name: "bash", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: "c1", content: "   " },
+      ],
+    };
+    assert.equal(onProvider(body, makeAgyCtx("chat")), undefined);
+  });
+
+  it("keeps legacy function_call turns and function results with empty content", () => {
+    const body = {
+      messages: [
+        { role: "user", content: "q" },
+        { role: "assistant", content: "", function_call: { name: "f", arguments: "{}" } },
+        { role: "function", name: "f", content: "" },
+      ],
+    };
+    assert.equal(onProvider(body, makeAgyCtx("chat")), undefined);
+  });
+
+  it("still drops an assistant turn that is empty and calls nothing", () => {
+    const out = onProvider(
+      {
+        messages: [
+          { role: "user", content: "q" },
+          { role: "assistant", content: " " },
+          { role: "user", content: "x-anthropic-billing-header: cc_version=1; cch=0;\nnext" },
+        ],
+      },
+      makeAgyCtx("chat"),
+    );
+    assert.deepEqual(
+      out.messages.map((m) => m.role),
+      ["user", "user"],
+    );
+  });
+});
+
+describe("Input is never modified", () => {
+  const billing = "x-anthropic-billing-header: cc_version=2.1.80; cc_entrypoint=cli; cch=0;";
+  const cases = {
+    anthropic: {
+      system: "You are Claude Code, Anthropic's official CLI for Claude.",
+      messages: [
+        { role: "user", content: [{ type: "text", text: billing }, { type: "text", text: "first" }] },
+        { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        { role: "user", content: [{ type: "text", text: billing }, { type: "text", text: "second" }] },
+      ],
+    },
+    chat: {
+      messages: [
+        { role: "system", content: "You are Claude Code, Anthropic's official CLI for Claude." },
+        { role: "user", content: [{ type: "text", text: billing }, { type: "text", text: "first" }] },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: [{ type: "text", text: billing }, { type: "text", text: "second" }] },
+      ],
+    },
+    responses: {
+      instructions: "You are Codex, based on GPT-5.",
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: billing }, { type: "input_text", text: "first" }] },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: billing }, { type: "input_text", text: "second" }] },
+      ],
+    },
+    gemini: {
+      systemInstruction: { parts: [{ text: "You are Claude Code, Anthropic's official CLI for Claude." }] },
+      contents: [
+        { role: "user", parts: [{ text: billing }, { text: "first" }] },
+        { role: "model", parts: [{ text: "ok" }] },
+        { role: "user", parts: [{ text: billing }, { text: "second" }] },
+      ],
+    },
+  };
+
+  for (const [protocol, body] of Object.entries(cases)) {
+    it(`${protocol}: returns a new body and leaves the caller's object untouched`, () => {
+      const snapshot = JSON.stringify(body);
+      const out = onProvider(body, makeAgyCtx(protocol));
+      assert.notEqual(out, undefined);
+      assert.equal(JSON.stringify(out).includes("billing"), false);
+      assert.equal(JSON.stringify(body), snapshot);
+    });
+  }
+});
+
+describe("Literal prefilters do not change results", () => {
+  it("only normalizes whitespace in prose that merely mentions billing", () => {
+    // no header-shaped token: the header pass is skipped
+    assert.equal(
+      cleanText("Our billing module retries twice.\n\n\n\nSee the invoice code. "),
+      "Our billing module retries twice.\n\nSee the invoice code.",
+    );
+    // "billing:" looks like a header token, so the header pass runs and finds nothing to strip
+    assert.equal(
+      cleanText("Fix the billing module.\n\n\n\nThe billing: label is wrong  "),
+      "Fix the billing module.\n\nThe billing: label is wrong",
+    );
+    assert.equal(cleanText("nothing suspicious here  "), "nothing suspicious here  ");
+  });
+
+  it("still strips billing pseudo-headers in every documented shape", () => {
+    for (const header of [
+      "x-anthropic-billing-header: cc_version=1; cch=0;",
+      "x-billing: 1",
+      "X-Client-Billing-Info: abc",
+      "anthropic-billing-header: z",
+      "x-trace: cc_entrypoint=cli",
+    ]) {
+      assert.equal(cleanText(`keep this\n${header}\nand this`), "keep this\nand this", header);
+    }
+  });
+
+  it("re-checks later passes after an earlier pass joins text fragments", () => {
+    // Removing the SDK sentence turns "secu" + "rity testing" into the security policy trigger.
+    const text =
+      "IMPORTANT: Assist with authorized secuYou are a Claude agent, built on Anthropic's Claude Agent SDK.rity testing, CTF challenges, or defensive use cases.\nKeep this line.";
+    assert.equal(cleanText(text), "Keep this line.");
+  });
+
+  it("normalizes identity sentences wherever an opener appears, including across lines", () => {
+    assert.equal(
+      normalizeSystemIdentity("Intro.\nYou\nare a helpful AI assistant created by Example Corp. Rest stays."),
+      `Intro.\n${OFFICIAL_ANTIGRAVITY_IDENTITY} Rest stays.`,
+    );
+    assert.equal(
+      normalizeSystemIdentity("你是由 Example 公司开发的助手。然后继续。"),
+      `${OFFICIAL_ANTIGRAVITY_IDENTITY}然后继续。`,
+    );
+    // an opener that is not an identity declaration is left alone, and scanning continues after it
+    assert.equal(
+      normalizeSystemIdentity("You are welcome to ask. You are Cursor, an intelligent programming assistant."),
+      `You are welcome to ask. ${OFFICIAL_ANTIGRAVITY_IDENTITY}`,
+    );
+  });
+
+  it("treats a literal placeholder in the text the same way with or without a matching pass", () => {
+    const text = "see __PROMPT_SANITIZER_CODE_BLOCK_0__ in opencode and\n```js\nconst a = 1;\n```";
+    assert.equal(cleanText(text), cleanText(`${text}\n`));
+  });
+});
