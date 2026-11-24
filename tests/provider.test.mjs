@@ -4457,6 +4457,45 @@ describe("fetch.mjs", () => {
       }),
     });
     assert.equal(sent[sent.length - 1].generationConfig.thinkingConfig.thinkingLevel, "xhigh");
+
+    // 6. Anthropic thinking.type="between_tools" (Magpie Sonnet 5.5 ThinkOff) maps to {"type":"disabled"} on messages & count_tokens and skips effort alignment
+    await fetcher("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "x-session-id": "anth-bt" },
+      body: JSON.stringify({
+        model: "claude-sonnet-5-5",
+        max_tokens: 32000,
+        output_config: { effort: "high", format: { type: "json_schema", schema: { type: "object" } } },
+        messages: [{ role: "user", content: bigText }],
+      }),
+    });
+    await fetcher("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "x-session-id": "anth-bt" },
+      body: JSON.stringify({
+        model: "claude-sonnet-5-5",
+        max_tokens: 1024,
+        thinking: { type: "between_tools" },
+        output_config: { effort: "high", format: { type: "json_schema", schema: { type: "object" } } },
+        messages: [{ role: "user", content: bigText }, { role: "user", content: "side classifier" }],
+      }),
+    });
+    assert.deepEqual(sent[sent.length - 1].thinking, { type: "disabled" });
+    assert.deepEqual(sent[sent.length - 1].output_config, {
+      effort: "high",
+      format: { type: "json_schema", schema: { type: "object" } },
+    });
+
+    await fetcher("http://localhost/v1/messages/count_tokens", {
+      method: "POST",
+      headers: { "x-session-id": "anth-bt" },
+      body: JSON.stringify({
+        model: "claude-sonnet-5-5",
+        thinking: { type: "between_tools" },
+        messages: [{ role: "user", content: "count" }],
+      }),
+    });
+    assert.deepEqual(sent[sent.length - 1].thinking, { type: "disabled" });
   });
 
   it("normalizes 502 content policy, 401 kept/expired & 400 API_KEY_INVALID, 429 CooldownError/upstream 429, and 404 model_not_found", async () => {
