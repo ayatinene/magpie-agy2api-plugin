@@ -23,8 +23,9 @@ Antigravity2API (v0.1.12+) 的 Magpie 专用 Provider 插件与提示词清洗�
   - `400` 内容拒绝：针对 OpenAI / Anthropic / Gemini 的上游内容审查拒绝（含上游固定的 `Upstream rejected the input: SAFETY|BLOCKLIST|PROHIBITED_CONTENT` 形态）注入 Magpie `policyRefusal` 识别字段，避免触发误判限流冷却。
 - **共享 / 家庭组去重配额统计**：
   - 支持 `ready` 与 `cooling` 状态账号（单池冷却不影响其他健康配额池，模型级冷却计入对应模型，重置时间已过的桶按已恢复处理，账号仍有可用 AI 积分时不报耗尽）。
-  - 动态发现配额池（`Gemini`、`Claude & GPT`、`Gemini 4 Argon` 及未来新增池），支持 Ultra / Ultra-lite 账号的 Argon -> Gemini 桶映射；无可靠配额池归属的模型不生成用量窗。
-  - 通过并查集对 `shared[group]` 与 `family`（已启动周桶 `< 1` 且 `reset_time` 相差 `<= 2s`）自动去重，不重复计入池加权容量。
+  - 配额池按可调度账号在 `GET /api/accounts` 中实际返回的额度桶动态发现（`gemini-5h`、`gemini-weekly` 属于 `Gemini` 池，`3p-*` 属于 `Claude & GPT` 池）。池汇总与账号明细只展示账号实际拥有的池，不按模型的 `quota_group` 生成：没有账号返回独立 Argon 桶时不会出现 `Gemini 4 Argon` 池，只有部分账号有时该池只统计这些账号。
+  - 模型的 `quota_group` 只用于各模型的路由用量窗，由每个账号解析到它实际扣减的池：账号没有独立 Argon 桶而有 Gemini 桶时，Argon 模型计入该账号的 Gemini 池（与 Antigravity2API 的调度规则一致），因此独立 Argon 桶与共用 Gemini 桶的账号可以并存。没有 `quota_group` 的模型不生成用量窗。
+  - 通过并查集对 `shared[池]` 与 `family`（已启动周桶 `< 1` 且 `reset_time` 相差 `<= 2s`）自动去重，只合并从同一个池扣减的账号，不重复计入池加权容量。
   - 剩余配额为正时已用百分比最高显示 `99%`，未知配额不误判为 `100%` 已用；配额刷新失败、部分失败或回退旧缓存时均给出明确提示。
 
 ## 安装

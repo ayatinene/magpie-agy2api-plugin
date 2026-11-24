@@ -22,7 +22,9 @@ import {
   clearQuotaCache,
   computeAgy2ApiUsage,
   extractAccountGroupQuota,
+  extractAccountPoolQuota,
   getAgy2ApiUsage,
+  resolveAccountPool,
 } from "../lib/quota.mjs";
 import {
   clearPrefixEffortCache,
@@ -1040,11 +1042,142 @@ describe("quota.mjs", () => {
 
     const q = extractAccountGroupQuota(ultraAcc, "gemini-argon-wtu", nowMs);
     assert.equal(q.known, true);
-    assert.equal(q.mappedFromGemini, true);
+    assert.equal(q.pool, "gemini");
     assert.equal(q.inCooldown, true);
     assert.equal(q.effectiveRem, 0);
     assert.equal(q.h5, 70);
     assert.equal(q.weekly, 90);
+
+    // The account itself has no Argon pool: asking for that pool directly finds nothing
+    assert.equal(resolveAccountPool(ultraAcc, "gemini-argon-wtu"), "gemini");
+    assert.equal(extractAccountPoolQuota(ultraAcc, "gemini-argon-wtu", nowMs).known, false);
+
+    // An account with its own Argon bucket keeps the group on that pool
+    const proAcc = {
+      ...ultraAcc,
+      id: "pro@example.com",
+      cooldown: undefined,
+      quota: [
+        ...ultraAcc.quota,
+        { bucket_id: "gemini-argon-wtu-weekly", window: "weekly", remaining_fraction: 0.4, reset_time: "2026-11-29T08:00:00Z" },
+      ],
+    };
+    assert.equal(resolveAccountPool(proAcc, "gemini-argon-wtu"), "gemini-argon-wtu");
+    const proQ = extractAccountGroupQuota(proAcc, "gemini-argon-wtu", nowMs);
+    assert.equal(proQ.pool, "gemini-argon-wtu");
+    assert.equal(proQ.weekly, 40);
+    assert.equal(proQ.h5, null);
+
+    // Groups without a fallback rule stay on their own pool even when the account lacks it
+    assert.equal(resolveAccountPool(ultraAcc, "3p"), "3p");
+    assert.equal(extractAccountGroupQuota(ultraAcc, "3p", nowMs).known, false);
+  });
+
+  it("shows only pools accounts actually have: no Argon pool, row segment or model pool when Argon is billed to Gemini", () => {
+    const nowMs = Date.parse("2026-11-24T03:00:00Z");
+    const gem = (h5, weekly) => [
+      { bucket_id: "gemini-5h", window: "5h", remaining_fraction: h5, reset_time: "2026-11-24T06:00:00Z" },
+      { bucket_id: "gemini-weekly", window: "weekly", remaining_fraction: weekly, reset_time: "2026-12-01T03:00:00Z" },
+    ];
+    const tp = (weekly) => [
+      { bucket_id: "3p-5h", window: "5h", remaining_fraction: 1, reset_time: "2026-11-24T06:00:00Z" },
+      { bucket_id: "3p-weekly", window: "weekly", remaining_fraction: weekly, reset_time: "2026-11-29T06:00:00Z" },
+    ];
+    const argon = (weekly) => [
+      { bucket_id: "gemini-argon-wtu-weekly", window: "weekly", remaining_fraction: weekly, reset_time: "2026-11-29T08:00:00Z" },
+    ];
+    const options = {
+      nowMs,
+      discoveredModels: {
+        "gemini-4-neon": { id: "gemini-4-neon" },
+        "gemini-4-argon": { id: "gemini-4-argon" },
+        "claude-opus-5-5": { id: "claude-opus-5-5" },
+      },
+      modelQuotaGroupMap: new Map([
+        ["gemini-4-neon", "gemini"],
+        ["gemini-4-argon", "gemini-argon-wtu"],
+        ["claude-opus-5-5", "3p"],
+      ]),
+    };
+    const poolRows = (usage) =>
+      usage.windows.filter((w) => w.pool && !w.model).map((w) => `${w.pool} ${w.name} ${w.used}`);
+    const row = (usage, label) => usage.windows.find((w) => w.name.startsWith(`${label} ·`)).display;
+    const modelWin = (usage, id) => usage.windows.find((w) => !w.aside && w.model === id);
+
+    // 1. Every account bills Argon to its Gemini pool (what /api/accounts returns today)
+    const merged = computeAgy2ApiUsage(
+      [
+        { id: "ultra@example.com", label: "Ultra", state: "ready", tier: "g1-ultra-tier", quota: [...gem(0.8, 0.9), ...tp(1)] },
+        { id: "pro@example.com", label: "Pro", state: "ready", tier: "g1-pro-tier", quota: [...gem(1, 0.6), ...tp(0.5)] },
+      ],
+      options,
+    );
+    assert.deepEqual(poolRows(merged), [
+      "Gemini 5 hours 11",
+      "Gemini 7 days 23",
+      "Claude & GPT 5 hours 0",
+      "Claude & GPT 7 days 21",
+    ]);
+    assert.equal(merged.windows.some((w) => w.pool === "Gemini 4 Argon"), false);
+    assert.equal(row(merged, "Ultra"), "Gemini 80%/90% · Claude 100%/100%");
+    assert.equal(row(merged, "Pro"), "Gemini 100%/60% · Claude 100%/50%");
+    // The Argon model is still routed on the Gemini quota and is filed under the Gemini pool
+    assert.equal(modelWin(merged, "gemini-4-argon").pool, "Gemini");
+    assert.equal(modelWin(merged, "gemini-4-argon").used, modelWin(merged, "gemini-4-neon").used);
+    assert.equal(modelWin(merged, "gemini-4-argon").resetsAt, modelWin(merged, "gemini-4-neon").resetsAt);
+
+    // 2. Mixed: one account has its own Argon bucket, the other bills Argon to Gemini
+    const mixed = computeAgy2ApiUsage(
+      [
+        { id: "ultra@example.com", label: "Ultra", state: "ready", tier: "g1-ultra-tier", quota: [...gem(0.8, 0.9), ...tp(1)] },
+        { id: "pro@example.com", label: "Pro", state: "ready", tier: "g1-pro-tier", quota: [...gem(1, 0.6), ...tp(0.5), ...argon(0.2)] },
+      ],
+      options,
+    );
+    // The Argon pool is the Pro account's bucket alone: weekly only, no Gemini numbers mixed in
+    assert.deepEqual(poolRows(mixed), [
+      "Gemini 5 hours 11",
+      "Gemini 7 days 23",
+      "Claude & GPT 5 hours 0",
+      "Claude & GPT 7 days 21",
+      "Gemini 4 Argon 7 days 80",
+    ]);
+    assert.equal(row(mixed, "Ultra"), "Gemini 80%/90% · Claude 100%/100%");
+    assert.equal(row(mixed, "Pro"), "Gemini 100%/60% · Claude 100%/50%  Argon 20%");
+    // Routing still weighs both accounts: Ultra's Gemini 80% (x2.0) and Pro's Argon 20% (x1.5)
+    assert.equal(modelWin(mixed, "gemini-4-argon").pool, "Gemini 4 Argon");
+    assert.equal(modelWin(mixed, "gemini-4-argon").used, 46);
+    assert.equal(modelWin(mixed, "gemini-4-neon").pool, "Gemini");
+
+    // 3. Buckets left on a disabled account do not bring a pool back
+    const stale = computeAgy2ApiUsage(
+      [
+        { id: "pro@example.com", label: "Pro", state: "ready", tier: "g1-pro-tier", quota: [...gem(1, 0.6), ...tp(0.5)] },
+        { id: "off@example.com", label: "Off", state: "disabled", tier: "g1-pro-tier", quota: [...gem(1, 1), ...argon(0.1)] },
+      ],
+      options,
+    );
+    assert.equal(stale.windows.some((w) => w.pool === "Gemini 4 Argon"), false);
+    assert.equal(modelWin(stale, "gemini-4-argon").pool, "Gemini");
+    assert.equal(row(stale, "Off"), "已禁用");
+
+    // 4. A leftover future cooldown keyed by the group does not create a pool or block the model:
+    //    the account bills Argon to Gemini, so only its Gemini cooldown counts
+    const leftover = computeAgy2ApiUsage(
+      [
+        {
+          id: "pro@example.com",
+          label: "Pro",
+          state: "cooling",
+          tier: "g1-pro-tier",
+          cooldown: { "gemini-argon-wtu": "2026-11-29T08:00:00Z" },
+          quota: [...gem(1, 0.6), ...tp(0.5)],
+        },
+      ],
+      options,
+    );
+    assert.equal(leftover.windows.some((w) => w.pool === "Gemini 4 Argon"), false);
+    assert.equal(modelWin(leftover, "gemini-4-argon").used, 40);
   });
 
   it("deduplicates shared[group] and matching family weekly buckets via Union-Find", () => {
@@ -1155,9 +1288,13 @@ describe("quota.mjs", () => {
 
     // Must NOT emit non-aside windows with used: 100
     assert.equal(usage.windows.filter((w) => !w.aside).length, 0);
-    const unknownRow = usage.windows.find((w) => w.aside && w.pool === "Gemini");
-    assert.equal(unknownRow.display, "未知");
-    assert.equal(unknownRow.used, undefined);
+    // No account has reported a bucket, so there is no pool to name: one unknown row, no pool
+    assert.equal(usage.windows.some((w) => w.pool), false);
+    const unknownRows = usage.windows.filter((w) => w.name === "配额");
+    assert.equal(unknownRows.length, 1);
+    assert.equal(unknownRows[0].display, "未知");
+    assert.equal(unknownRows[0].used, undefined);
+    assert.equal(unknownRows[0].aside, true);
   });
 
   it("caches accounts, debounces refresh, and distinguishes stale cache from live error", async () => {
