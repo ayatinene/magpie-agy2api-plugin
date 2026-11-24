@@ -142,8 +142,28 @@ async function readLiveOptions(input, staticOptions) {
   };
 }
 
+const PAGE_SERVICE_RETRY_MAX_MS = 3000;
+const PAGE_SERVICE_RETRY_LIMIT = 210;
+let pageServiceRun = 0;
+
+// A reload starts this host while the previous one may still be finishing streamed replies
+// and holding the port. A refused start is therefore retried (for about ten minutes) until
+// that host is gone; a later `server()` call takes over from an earlier loop.
+async function startPageServiceWhenFree(port) {
+  const run = ++pageServiceRun;
+  for (let attempt = 0; attempt < PAGE_SERVICE_RETRY_LIMIT && run === pageServiceRun; attempt += 1) {
+    const started = await startPageService({ port }).catch(() => null);
+    if (started?.ok || run !== pageServiceRun) return;
+    const delayMs = Math.min(PAGE_SERVICE_RETRY_MAX_MS, 250 * 2 ** Math.min(attempt, 4));
+    await new Promise((resolve) => {
+      setTimeout(resolve, delayMs).unref?.();
+    });
+  }
+}
+
 async function server(input, options) {
   if (options?.disablePageService === true) {
+    pageServiceRun += 1;
     await stopPageService().catch(() => {});
   } else {
     const rawPort = Number(options?.pageServicePort);
@@ -151,7 +171,7 @@ async function server(input, options) {
       Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535
         ? rawPort
         : DEFAULT_PAGE_SERVICE_PORT;
-    void startPageService({ port }).catch(() => {});
+    void startPageServiceWhenFree(port);
   }
 
   let configuredBaseUrl = DEFAULT_BASE_URL;

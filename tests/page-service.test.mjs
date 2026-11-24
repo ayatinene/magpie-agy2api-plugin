@@ -871,4 +871,48 @@ describe("startPageService & plugin wiring", () => {
     assert.equal(hooks.provider.id, "agy2api");
     assert.equal(registry.size, 0);
   });
+
+  it("keeps trying to start when the previous plugin host still holds the port, and stops trying once disabled", async () => {
+    const registry = globalThis[Symbol.for("magpie.agy2api.pageServices")];
+    const health = async (port) => {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(500) });
+        return res.status === 200 ? (await res.json()).ok : false;
+      } catch {
+        return false;
+      }
+    };
+    const waitFor = async (check, ms) => {
+      const deadline = Date.now() + ms;
+      while (Date.now() < deadline) {
+        if (await check()) return true;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return false;
+    };
+
+    // 1. The old host is still listening when the reloaded plugin starts
+    const port = await allocateFreePort();
+    const oldHost = net.createServer((socket) => socket.destroy());
+    await new Promise((resolve) => oldHost.listen(port, "127.0.0.1", resolve));
+    cleanups.push(() => stopPageService());
+    await plugin.server({}, { pageServicePort: port });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(registry.get(port)?.server?.listening ?? false, false);
+
+    // It exits a moment later: the page service comes up on its own
+    await new Promise((resolve) => oldHost.close(() => resolve()));
+    assert.equal(await waitFor(() => health(port), 4000), true);
+
+    // 2. Disabling the service while a start is still being retried ends the retries
+    const port2 = await allocateFreePort();
+    const blocker = net.createServer((socket) => socket.destroy());
+    await new Promise((resolve) => blocker.listen(port2, "127.0.0.1", resolve));
+    await plugin.server({}, { pageServicePort: port2 });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    await plugin.server({}, { disablePageService: true });
+    await new Promise((resolve) => blocker.close(() => resolve()));
+    assert.equal(await waitFor(() => health(port2), 1500), false);
+    assert.equal(registry.size, 0);
+  });
 });
