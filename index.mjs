@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { DEFAULT_BASE_URL, normalizeBaseUrl, resolveAuth } from "./lib/auth.mjs";
 import {
+  ensureModelsDiscovered,
   getDiscoveredModels,
   getModelMetadataMap,
   getModelQuotaGroupMap,
@@ -257,6 +258,7 @@ async function server(input, options) {
             zh: "隐藏插件生成的思考强度后缀项，保留上游独立 ID/别名。",
           },
           default: false,
+          filtersModels: true,
         },
         {
           key: "preserve_cache_effort",
@@ -315,18 +317,6 @@ async function server(input, options) {
         const { apiKey, baseUrl, adminUsername, adminPassword } = resolveAuth(auth, {
           defaultBaseUrl: fallbackBaseUrl,
         });
-        let preserveCacheEffort = true;
-        try {
-          const pick = createOptionReader(input, options);
-          preserveCacheEffort = await pick(
-            "preserveCacheEffort",
-            "preserve_cache_effort",
-            tryCoerceBool,
-            true,
-          );
-        } catch {
-          preserveCacheEffort = true;
-        }
         return {
           apiKey,
           baseURL: baseUrl,
@@ -336,7 +326,13 @@ async function server(input, options) {
             apiKey,
             adminUsername,
             adminPassword,
-            preserveCacheEffort,
+            getPreserveCacheEffort: () =>
+              createOptionReader(input, options)(
+                "preserveCacheEffort",
+                "preserve_cache_effort",
+                tryCoerceBool,
+                true,
+              ),
             getAuth,
             getPluginOptions: () => options,
           }),
@@ -349,12 +345,21 @@ async function server(input, options) {
           typeof provider?.api === "string" && provider.api.trim()
             ? normalizeBaseUrl(provider.api)
             : configuredBaseUrl;
-        const { baseUrl, adminUsername, adminPassword } = resolveAuth(auth, {
+        const { apiKey, baseUrl, adminUsername, adminPassword } = resolveAuth(auth, {
           defaultBaseUrl: fallbackBaseUrl,
         });
+        const authScope = { baseUrl, apiKey, adminUsername, adminPassword };
         const live = await readLiveOptions(input, options);
+        if (!getDiscoveredModels(authScope)) {
+          await ensureModelsDiscovered(authScope, undefined, {
+            signal: ctx?.signal,
+            timeoutMs: 4000,
+            foldEffortVariants: live.foldEffortVariants,
+          }).catch(() => null);
+        }
         return getAgy2ApiUsage({
           baseUrl,
+          apiKey,
           adminUsername,
           adminPassword,
           showAccountDetails: live.showAccountDetails,
@@ -364,10 +369,10 @@ async function server(input, options) {
           cacheTtlSec: live.cacheTtlSec,
           refreshCooldownSec: live.refreshCooldownSec,
           discoveredModels:
-            getDiscoveredModels(baseUrl, { foldEffortVariants: live.foldEffortVariants }) ??
+            getDiscoveredModels(authScope, { foldEffortVariants: live.foldEffortVariants }) ??
             provider?.models,
-          modelQuotaGroupMap: getModelQuotaGroupMap(baseUrl),
-          modelMetadataMap: getModelMetadataMap(baseUrl),
+          modelQuotaGroupMap: getModelQuotaGroupMap(authScope),
+          modelMetadataMap: getModelMetadataMap(authScope),
           signal: ctx?.signal,
         });
       },

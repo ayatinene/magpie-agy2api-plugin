@@ -881,6 +881,82 @@
     setStatus("sync.fail", "err", true, { err: syncErrText(err) });
   }
 
+  function fetchPresetsOnce() {
+    try {
+      return Promise.resolve(fetch("api/upstream-presets", {
+        method: "GET",
+        credentials: "omit",
+        headers: { accept: "application/json" },
+      })).then(function (res) {
+        return res.json().then(function (data) {
+          return { res: res, data: data, jsonOk: true };
+        }, function () {
+          return { res: res, data: null, jsonOk: false };
+        });
+      });
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
+
+  function sleepMs(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function isWakeEligibleFailure(r, err) {
+    if (err) return true;
+    if (!r || !r.res) return true;
+    if (r.res.status === 0) return true;
+    return r.res.status === 502 && (!r.jsonOk || !isObj(r.data));
+  }
+
+  function waitForServiceHealthy(deadlineMs, delayMs) {
+    var now = Date.now();
+    if (now >= deadlineMs) return Promise.resolve(false);
+    return Promise.resolve().then(function () {
+      return fetch("health", {
+        method: "GET",
+        credentials: "omit",
+        cache: "no-store",
+        headers: { accept: "application/json" },
+      });
+    }).then(function (res) {
+      if (!res || res.status !== 200) return false;
+      return res.json().then(function (d) {
+        return isObj(d) && d.ok === true;
+      }, function () {
+        return false;
+      });
+    }, function () {
+      return false;
+    }).then(function (healthy) {
+      if (healthy) return true;
+      var rem = deadlineMs - Date.now();
+      if (rem <= 0) return false;
+      var wait = Math.min(delayMs, rem);
+      var nextDelay = Math.min(delayMs * 2, 1000);
+      return sleepMs(wait).then(function () {
+        return waitForServiceHealthy(deadlineMs, nextDelay);
+      });
+    });
+  }
+
+  function wakeServiceAndRetryPresets(originalErr) {
+    var deadlineMs = Date.now() + 8000;
+    return Promise.resolve().then(function () {
+      return fetch("./", { method: "GET", credentials: "omit", cache: "no-store" });
+    }).then(function () {
+      return null;
+    }, function () {
+      return null;
+    }).then(function () {
+      return waitForServiceHealthy(deadlineMs, 250);
+    }).then(function (healthy) {
+      if (!healthy) throw (originalErr || new Error("HTTP 502"));
+      return fetchPresetsOnce();
+    });
+  }
+
   function onSync() {
     if (syncing || saving || loadError || window.__magpieServiceHosted !== true) return;
     if (!syncArmed) {
@@ -900,21 +976,13 @@
     setStatus("", "");
     renderSync();
     renderFooter();
-    var req;
-    try {
-      req = fetch("api/upstream-presets", {
-        method: "GET",
-        credentials: "omit",
-        headers: { accept: "application/json" },
-      });
-    } catch (e) {
-      syncFail(e);
-      return;
-    }
-    Promise.resolve(req).then(function (res) {
-      return res.json().then(function (data) { return { res: res, data: data }; }, function () {
-        return { res: res, data: null };
-      });
+    fetchPresetsOnce().then(function (r) {
+      if (isWakeEligibleFailure(r, null)) {
+        return wakeServiceAndRetryPresets(new Error("HTTP " + r.res.status));
+      }
+      return r;
+    }, function (err) {
+      return wakeServiceAndRetryPresets(err);
     }).then(function (r) {
       var data = r.data;
       if (!r.res.ok || !isObj(data) || data.ok !== true || !Array.isArray(data.rules) || data.rules.length === 0) {

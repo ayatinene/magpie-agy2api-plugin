@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -914,5 +915,269 @@ describe("startPageService & plugin wiring", () => {
     await new Promise((resolve) => blocker.close(() => resolve()));
     assert.equal(await waitFor(() => health(port2), 1500), false);
     assert.equal(registry.size, 0);
+  });
+
+  it("sanitizer-panel.js onSync wakes dormant service on non-JSON 502 or network error, polls health, retries, and skips retry on JSON 502", async () => {
+    const jsSource = fs.readFileSync(path.join(PLUGIN_ROOT, "ui/sanitizer-panel.js"), "utf8");
+
+    function createPanelHarness(fetchMock) {
+      const elements = new Map();
+      const makeEl = (id) => {
+        const listeners = {};
+        const el = {
+          id,
+          textContent: "",
+          innerHTML: "",
+          value: "",
+          checked: false,
+          disabled: false,
+          hidden: false,
+          dataset: {},
+          className: "",
+          style: {},
+          attributes: {},
+          children: [],
+          classList: {
+            add() {},
+            remove() {},
+            toggle() {},
+            contains() { return false; },
+          },
+          setAttribute(k, v) { this.attributes[k] = String(v); },
+          getAttribute(k) { return this.attributes[k]; },
+          addEventListener(type, fn) {
+            listeners[type] = listeners[type] || [];
+            listeners[type].push(fn);
+          },
+          dispatch(type) {
+            for (const fn of listeners[type] || []) fn({ target: el, preventDefault() {} });
+          },
+          appendChild(child) {
+            if (child && typeof child === "object") child.parentNode = el;
+            this.children.push(child);
+            return child;
+          },
+          removeChild(child) {
+            const idx = this.children.indexOf(child);
+            if (idx >= 0) this.children.splice(idx, 1);
+            return child;
+          },
+          get firstChild() { return this.children[0] || null; },
+          get lastChild() { return this.children[this.children.length - 1] || null; },
+          querySelector() { return null; },
+          querySelectorAll() { return []; },
+          focus() {},
+        };
+        return el;
+      };
+      for (const id of [
+        "app", "status", "btn-save", "btn-revert", "btn-reset", "btn-sync-upstream", "btn-add",
+        "opt-enabled", "opt-rules-enabled", "opt-norm-id", "opt-tools", "opt-sideload",
+        "rules-list", "rules-summary", "rules-toggle", "rules-chevron", "rules-body",
+        "banner-err", "banner-text", "btn-retry", "foot-hint", "empty-rules",
+      ]) {
+        elements.set(id, makeEl(id));
+      }
+
+      const listeners = {};
+      const documentMock = {
+        documentElement: { lang: "en", setAttribute() {} },
+        title: "",
+        getElementById(id) {
+          if (!elements.has(id)) elements.set(id, makeEl(id));
+          return elements.get(id);
+        },
+        createElement(tag) { return makeEl(tag); },
+        createElementNS(_ns, tag) { return makeEl(tag); },
+        createDocumentFragment() { return makeEl("fragment"); },
+        createTextNode(text) { return { nodeType: 3, textContent: String(text || "") }; },
+        querySelectorAll() { return []; },
+        addEventListener(type, fn) {
+          listeners[type] = listeners[type] || [];
+          listeners[type].push(fn);
+        },
+      };
+      const windowMock = {
+        __magpieServiceHosted: true,
+        magpie: {
+          ready: Promise.resolve({ lang: "en" }),
+          options: {
+            get: async () => ({
+              promptSanitizer: true,
+              promptRewrite: {
+                enabled: true,
+                normalize_identity: true,
+                sideload_mode: "off",
+                sanitize_tools_description: true,
+                rules: [{ id: "r1", pattern: "foo", replacement: "bar", scope: "all", enabled: true }],
+              },
+            }),
+          },
+        },
+        location: { search: "", href: "http://127.0.0.1:18417/", replace() {} },
+        parent: {
+          postMessage(msg) {
+            if (msg?.method === "magpie.options.get") {
+              setTimeout(() => {
+                for (const fn of listeners.message || []) {
+                  fn({
+                    source: windowMock.parent,
+                    data: {
+                      type: "magpie-page-rpc-response",
+                      id: msg.id,
+                      result: {
+                        promptSanitizer: true,
+                        promptRewrite: {
+                          enabled: true,
+                          normalize_identity: true,
+                          sideload_mode: "off",
+                          sanitize_tools_description: true,
+                          rules: [{ id: "r1", pattern: "foo", replacement: "bar", scope: "all", enabled: true }],
+                        },
+                      },
+                    },
+                  });
+                }
+              }, 0);
+            }
+          },
+        },
+        addEventListener(type, fn) {
+          listeners[type] = listeners[type] || [];
+          listeners[type].push(fn);
+        },
+      };
+      windowMock.window = windowMock;
+
+      const sandbox = {
+        window: windowMock,
+        document: documentMock,
+        navigator: { language: "en-US" },
+        URLSearchParams,
+        fetch: fetchMock,
+        setTimeout,
+        clearTimeout,
+        Date,
+        Promise,
+        Error,
+        Math,
+        Object,
+        Array,
+        String,
+        Boolean,
+        Number,
+        JSON,
+        RegExp,
+      };
+      vm.runInNewContext(jsSource, sandbox);
+      for (const fn of listeners.DOMContentLoaded || []) fn();
+      return { elements, sandbox };
+    }
+
+    // Case 1: Non-JSON proxy 502 -> wakes "./", polls health until {ok:true}, retries api/upstream-presets while keeping syncing=true
+    const calls1 = [];
+    let presetAttempt = 0;
+    let healthAttempt = 0;
+    let syncingDuringWake = null;
+    const h1 = createPanelHarness(async (url) => {
+      const u = String(url);
+      calls1.push(u);
+      if (u === "api/upstream-presets") {
+        presetAttempt++;
+        if (presetAttempt === 1) {
+          return new Response("502 Bad Gateway (dormant)", {
+            status: 502,
+            headers: { "content-type": "text/plain" },
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            rules: [{ id: "upstream-1", pattern: "abc", replacement: "xyz", scope: "all", enabled: true }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (u === "./") {
+        syncingDuringWake = h1.elements.get("btn-sync-upstream").getAttribute("aria-busy");
+        return new Response("<html></html>", { status: 200, headers: { "content-type": "text/html" } });
+      }
+      if (u === "health") {
+        healthAttempt++;
+        if (healthAttempt === 1) {
+          return new Response("starting", { status: 502 });
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected ${u}`);
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    const syncBtn1 = h1.elements.get("btn-sync-upstream");
+    syncBtn1.dispatch("click"); // arm confirmation
+    syncBtn1.dispatch("click"); // execute sync
+    await new Promise((r) => setTimeout(r, 400));
+
+    assert.equal(syncingDuringWake, "true");
+    assert.equal(syncBtn1.getAttribute("aria-busy"), "false");
+    assert.deepEqual(calls1, ["api/upstream-presets", "./", "health", "health", "api/upstream-presets"]);
+    assert.equal(h1.elements.get("status").className.includes("ok"), true);
+
+    // Case 2: JSON 502 { ok: false, error: "upstream github 503" } MUST NOT wake or retry
+    const calls2 = [];
+    const h2 = createPanelHarness(async (url) => {
+      const u = String(url);
+      calls2.push(u);
+      if (u === "api/upstream-presets") {
+        return new Response(JSON.stringify({ ok: false, error: "upstream github 503" }), {
+          status: 502,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`Should not call ${u}`);
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    const syncBtn2 = h2.elements.get("btn-sync-upstream");
+    syncBtn2.dispatch("click");
+    syncBtn2.dispatch("click");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(calls2, ["api/upstream-presets"]);
+    assert.match(h2.elements.get("status").textContent, /upstream github 503/);
+
+    // Case 3: Fetch reject (network error while host asleep) also wakes "./", polls health, and retries
+    const calls3 = [];
+    let p3 = 0;
+    const h3 = createPanelHarness(async (url) => {
+      const u = String(url);
+      calls3.push(u);
+      if (u === "api/upstream-presets") {
+        p3++;
+        if (p3 === 1) throw new TypeError("Failed to fetch");
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            rules: [{ id: "net-1", pattern: "foo", replacement: "bar", scope: "all", enabled: true }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (u === "./") return new Response("<html></html>", { status: 200 });
+      if (u === "health") {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected ${u}`);
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    const syncBtn3 = h3.elements.get("btn-sync-upstream");
+    syncBtn3.dispatch("click");
+    syncBtn3.dispatch("click");
+    await new Promise((r) => setTimeout(r, 80));
+    assert.deepEqual(calls3, ["api/upstream-presets", "./", "health", "api/upstream-presets"]);
+    assert.equal(h3.elements.get("status").className.includes("ok"), true);
   });
 });

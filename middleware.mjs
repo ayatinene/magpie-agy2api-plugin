@@ -12,7 +12,7 @@
 
 import { sanitizeRequestBody } from "./lib/sanitize-request.mjs";
 
-export const DEFAULT_TARGET_PROVIDER_ID = "agy2api";
+export const DEFAULT_TARGET_PROVIDER_IDS = ["agy2api", "agy2api-plugin"];
 
 export function onProvider(body, ctx) {
   try {
@@ -21,11 +21,17 @@ export function onProvider(body, ctx) {
     }
 
     const options = ctx?.options;
-    const targetProviderId =
-      (typeof options?.providerId === "string" && options.providerId.trim()) ||
-      DEFAULT_TARGET_PROVIDER_ID;
+    const explicitProviderId =
+      typeof options?.providerId === "string" ? options.providerId.trim() : "";
+    const providerId = ctx?.provider?.id;
+    const matched = explicitProviderId
+      ? providerId === explicitProviderId
+      : DEFAULT_TARGET_PROVIDER_IDS.includes(providerId);
+    if (!matched) {
+      return undefined;
+    }
 
-    if (ctx?.provider?.id !== targetProviderId) {
+    if (ctx?.provider?.account === "plugin" && options?.forceMiddlewareOnPlugin !== true) {
       return undefined;
     }
 

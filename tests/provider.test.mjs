@@ -534,6 +534,57 @@ describe("auth.mjs", () => {
     setTimeout(() => ctl.abort(), 15);
     await assert.rejects(() => sigRes.json());
   });
+
+  it("clears sessionCache when adminFetch retry after 401 still gets 401 or 403", async () => {
+    for (const retryStatus of [401, 403]) {
+      clearAdminSessionCache();
+      let loginCalls = 0;
+      let accountCalls = 0;
+      let failRetry = true;
+      const fetchImpl = async (url) => {
+        if (url.endsWith("/api/session")) {
+          loginCalls++;
+          return makeJsonResponse(
+            {},
+            200,
+            { "set-cookie": `antigravity_admin=tok-${loginCalls}; Path=/api` },
+          );
+        }
+        if (url.endsWith("/api/accounts")) {
+          accountCalls++;
+          if (failRetry) {
+            return makeJsonResponse(
+              { error: retryStatus === 401 ? "admin_login_required" : "forbidden" },
+              accountCalls === 1 ? 401 : retryStatus,
+            );
+          }
+          return makeJsonResponse({ accounts: [] }, 200);
+        }
+        throw new Error(`Unexpected URL: ${url}`);
+      };
+
+      await assert.rejects(
+        () =>
+          adminFetch("/api/accounts", {
+            baseUrl: "https://clear-cache.example.invalid",
+            adminPassword: "pw",
+            fetchImpl,
+          }),
+        new RegExp(`HTTP ${retryStatus}`),
+      );
+      assert.equal(loginCalls, 2);
+
+      // Next call must re-login because the second cookie was evicted from sessionCache
+      failRetry = false;
+      const okRes = await adminFetch("/api/accounts", {
+        baseUrl: "https://clear-cache.example.invalid",
+        adminPassword: "pw",
+        fetchImpl,
+      });
+      assert.equal(okRes.status, 200);
+      assert.equal(loginCalls, 3);
+    }
+  });
 });
 
 describe("models.mjs", () => {
@@ -621,7 +672,7 @@ describe("models.mjs", () => {
       { fetchImpl, foldEffortVariants: false },
     );
 
-    assert.deepEqual(paths, ["/api/session", "/api/models"]);
+    assert.deepEqual(paths, ["/api/session", "/api/models", "/api/settings"]);
 
     // Base models + expanded effort models
     assert.ok(models["gemini-4-neon"]);
@@ -640,7 +691,7 @@ describe("models.mjs", () => {
     assert.ok(models["gemini-4-neon-low"]);
     assert.ok(models["gemini-4-neon-xhigh"]);
     assert.equal(models["gemini-4-neon-xhigh"].name, "Gemini 4 Neon (XHigh)");
-    assert.deepEqual(models["gemini-4-neon-xhigh"].variants, {});
+    assert.deepEqual(models["gemini-4-neon-xhigh"].variants, { xhigh: {} });
 
     assert.equal(models["claude-opus-5-5"].api.npm, "@ai-sdk/anthropic");
     assert.equal(models["claude-opus-5-5"].api.url, `${remoteRoot}/v1`);
@@ -794,7 +845,7 @@ describe("models.mjs", () => {
     const result = await reconcileModels({}, ctx, deps);
     assert.deepEqual(Object.keys(result), []);
     assert.equal(result[Symbol.for("magpie.fellBack")], undefined);
-    assert.deepEqual(paths, ["/api/models", "/api/models"]);
+    assert.deepEqual(paths, ["/api/models", "/api/settings", "/api/models"]);
   });
 
   it("falls back to paginated /v1beta/models with camelCase fields and rejects duplicate pageToken cycles", async () => {
@@ -939,6 +990,227 @@ describe("models.mjs", () => {
     );
     assert.equal(isXhighGeminiModel(root, "gemini-fixture@20261001"), true);
     assert.equal(isXhighGeminiModel(root, "gemini-fixture@unknown"), false);
+  });
+
+  it("handles MODEL_MAPPING aliases without synthesizing suffixes, locks fixed-effort variants, filters internal models, and sets image/limit=0", async () => {
+    const root = "https://settings-models.example.invalid";
+    const models = await reconcileModels(
+      {},
+      {
+        auth: {
+          key: "sk-pub",
+          metadata: { baseUrl: root, adminUsername: "admin", adminPassword: "pw" },
+        },
+      },
+      {
+        fetchImpl: async (url) => {
+          const p = new URL(url).pathname;
+          if (p === "/api/session") {
+            return makeJsonResponse({}, 200, { "set-cookie": "antigravity_admin=tok-s; Path=/api" });
+          }
+          if (p === "/api/settings") {
+            return makeJsonResponse({
+              MODEL_MAPPING:
+                "alias-base:gemini-4-carbon, alias-fixed:gemini-4-carbon-high, alias-base:should-not-win, ns:colon:claude-opus-5-5",
+            });
+          }
+          if (p === "/api/models") {
+            return makeJsonResponse({
+              models: [
+                {
+                  id: "gemini-4-carbon",
+                  provider: "MODEL_PROVIDER_GOOGLE",
+                  quota_group: "gemini",
+                  thinking_levels: ["low", "medium", "high"],
+                  capabilities: { thinking: true },
+                },
+                {
+                  id: "alias-base",
+                  provider: "MODEL_PROVIDER_GOOGLE",
+                  quota_group: "gemini",
+                  thinking_levels: ["low", "medium", "high"],
+                  capabilities: { thinking: true },
+                },
+                {
+                  id: "alias-fixed",
+                  provider: "MODEL_PROVIDER_GOOGLE",
+                  quota_group: "gemini",
+                  thinking_levels: ["low", "medium", "high"],
+                  capabilities: { thinking: true },
+                },
+                {
+                  id: "gpt-oss-120b-medium",
+                  provider: "MODEL_PROVIDER_OPENAI",
+                  quota_group: "3p",
+                  thinking_levels: [],
+                  capabilities: { thinking: true },
+                },
+                {
+                  id: "proactive-observer-v10",
+                  capabilities: { transcription: true },
+                },
+                {
+                  id: "tab_flash_lite_preview",
+                  capabilities: { completion: true },
+                },
+                {
+                  id: "gemini-3-image",
+                  provider: "MODEL_PROVIDER_GOOGLE",
+                  capabilities: { image_generation: true, thinking: true },
+                },
+              ],
+            });
+          }
+          throw new Error(`Unexpected ${url}`);
+        },
+        foldEffortVariants: false,
+      },
+    );
+
+    // Non-chat internal models dropped
+    assert.equal(models["proactive-observer-v10"], undefined);
+    assert.equal(models["tab_flash_lite_preview"], undefined);
+
+    // Alias to base model does NOT synthesize -low/-medium/-high, keeps base variants
+    assert.ok(models["alias-base"]);
+    assert.equal(models["alias-base-low"], undefined);
+    assert.equal(models["alias-base-high"], undefined);
+    assert.deepEqual(Object.keys(models["alias-base"].variants), ["low", "medium", "high"]);
+
+    // Alias to fixed-suffix target locks variants to { high: {} } and synthesizes nothing
+    assert.ok(models["alias-fixed"]);
+    assert.equal(models["alias-fixed-low"], undefined);
+    assert.deepEqual(models["alias-fixed"].variants, { high: {} });
+
+    // Upstream fixed-suffix reasoning model locks variants to { medium: {} } (prevents borrowedEfforts)
+    assert.deepEqual(models["gpt-oss-120b-medium"].variants, { medium: {} });
+    assert.equal(models["gpt-oss-120b-medium"].capabilities.reasoning, true);
+
+    // Image model output: ["image"], toolcall: false, reasoning: false
+    assert.equal(models["gemini-3-image"].capabilities.output.image, true);
+    assert.equal(models["gemini-3-image"].capabilities.output.text, false);
+    assert.equal(models["gemini-3-image"].capabilities.toolcall, false);
+    assert.equal(models["gemini-3-image"].capabilities.reasoning, false);
+
+    // Missing limits default to 0 (no fabricated 128000 / 65536)
+    assert.deepEqual(models["gemini-4-carbon"].limit, { context: 0, output: 0 });
+  });
+
+  it("isolates model cache by auth scope, refreshes after TTL, treats valid public empty as {}, and throws expired on public auth rejection", async () => {
+    const root = "https://scope-empty.example.invalid";
+    let now = 1_700_000_000_000;
+    let modelVer = 1;
+
+    // 1. Scope isolation & TTL expiry in ensureModelsDiscovered
+    const { ensureModelsDiscovered } = await import("../lib/models.mjs");
+    const fetchScope = async (url, init) => {
+      const p = new URL(url).pathname;
+      const hdrs = new Headers(init?.headers);
+      if (p === "/api/models") return makeJsonResponse({ error: "admin_login_required" }, 401);
+      if (p === "/v1/models") {
+        if (hdrs.get("authorization") === "Bearer sk-a") {
+          return makeJsonResponse({ data: [{ id: `model-a-v${modelVer}` }] });
+        }
+        if (hdrs.get("authorization") === "Bearer sk-b") {
+          return makeJsonResponse({ data: [{ id: "model-b" }] });
+        }
+      }
+      if (p === "/v1beta/models") return makeJsonResponse({ models: [] });
+      throw new Error(`Unexpected ${url}`);
+    };
+
+    const a1 = await ensureModelsDiscovered(
+      { baseUrl: root, apiKey: "sk-a" },
+      undefined,
+      { fetchImpl: fetchScope, nowFn: () => now },
+    );
+    const b1 = await ensureModelsDiscovered(
+      { baseUrl: root, apiKey: "sk-b" },
+      undefined,
+      { fetchImpl: fetchScope, nowFn: () => now },
+    );
+    assert.ok(a1["model-a-v1"]);
+    assert.equal(a1["model-b"], undefined);
+    assert.ok(b1["model-b"]);
+    assert.equal(b1["model-a-v1"], undefined);
+
+    // After 60s TTL, ensureModelsDiscovered re-fetches
+    modelVer = 2;
+    now += 61_000;
+    const a2 = await ensureModelsDiscovered(
+      { baseUrl: root, apiKey: "sk-a" },
+      undefined,
+      { fetchImpl: fetchScope, nowFn: () => now },
+    );
+    assert.ok(a2["model-a-v2"]);
+
+    // 2. Valid public empty catalog (both 200 empty) clears old models without fellBack
+    clearModelCache();
+    let emptyPublic = false;
+    const emptyFetch = async (url) => {
+      const p = new URL(url).pathname;
+      if (p === "/api/models") return makeJsonResponse({ error: "admin_login_required" }, 401);
+      if (p === "/v1/models") {
+        return makeJsonResponse({ data: emptyPublic ? [] : [{ id: "old-public-model" }] });
+      }
+      if (p === "/v1beta/models") return makeJsonResponse({ models: [] });
+      throw new Error(`Unexpected ${url}`);
+    };
+    assert.ok(
+      (await reconcileModels({}, { auth: { key: "sk-empty", metadata: { baseUrl: root } } }, { fetchImpl: emptyFetch }))[
+        "old-public-model"
+      ],
+    );
+    emptyPublic = true;
+    const cleared = await reconcileModels(
+      {},
+      { auth: { key: "sk-empty", metadata: { baseUrl: root } } },
+      { fetchImpl: emptyFetch },
+    );
+    assert.deepEqual(Object.keys(cleared), []);
+    assert.equal(cleared[Symbol.for("magpie.fellBack")], undefined);
+
+    // 3. Public 401/403/Gemini 400 API_KEY_INVALID throws err.signIn === "expired", while admin 401 alone does NOT
+    clearModelCache();
+    await assert.rejects(
+      () =>
+        reconcileModels(
+          {},
+          { auth: { key: "sk-bad", metadata: { baseUrl: root } } },
+          {
+            fetchImpl: async (url) => {
+              const p = new URL(url).pathname;
+              if (p === "/api/models") return makeJsonResponse({ error: "admin_login_required" }, 401);
+              if (p === "/v1/models") return makeJsonResponse({ error: { code: "invalid_api_key" } }, 401);
+              if (p === "/v1beta/models") {
+                return makeJsonResponse(
+                  { error: { code: 400, details: [{ reason: "API_KEY_INVALID" }] } },
+                  400,
+                );
+              }
+              throw new Error(`Unexpected ${url}`);
+            },
+          },
+        ),
+      (err) => err?.signIn === "expired",
+    );
+
+    // Admin 401 alone with valid public endpoint succeeds normally
+    clearModelCache();
+    const okFromPublic = await reconcileModels(
+      {},
+      { auth: { key: "sk-good", metadata: { baseUrl: root, adminPassword: "wrong" } } },
+      {
+        fetchImpl: async (url) => {
+          const p = new URL(url).pathname;
+          if (p === "/api/session") return makeJsonResponse({ error: { code: "invalid_credentials" } }, 401);
+          if (p === "/v1/models") return makeJsonResponse({ data: [{ id: "public-ok-model" }] });
+          if (p === "/v1beta/models") return makeJsonResponse({ models: [] });
+          throw new Error(`Unexpected ${url}`);
+        },
+      },
+    );
+    assert.ok(okFromPublic["public-ok-model"]);
   });
 });
 
@@ -1247,11 +1519,11 @@ describe("quota.mjs", () => {
       },
     ];
 
-    // Expected weighted remaining:
-    // Component 1 (Alice+Bob): weight=2.0, effectiveRem=50
+    // Expected weighted remaining (shared 7d pool only; independent 5h takes max uncooled member):
+    // Component 1 (Alice+Bob): weight=2.0, compWeekly=80, max(min(60,80), min(50,80))=60
     // Component 2 (Carol+Dave): weight=1.5, effectiveRem=90 (min(100,90))
     // Component 3 (Erin): weight=1.0, effectiveRem=100
-    // Total = (2.0*50 + 1.5*90 + 1.0*100) / (2.0 + 1.5 + 1.0) = (100 + 135 + 100) / 4.5 = 335 / 4.5 = 74.44% -> 74% rem -> 26% used
+    // Total = (2.0*60 + 1.5*90 + 1.0*100) / (2.0 + 1.5 + 1.0) = (120 + 135 + 100) / 4.5 = 355 / 4.5 = 78.89% -> 79% rem -> 21% used
     const usage = computeAgy2ApiUsage(accounts, {
       discoveredModels: {
         "gemini-4-neon": { id: "gemini-4-neon", name: "Gemini 4 Neon", family: "Gemini" },
@@ -1261,7 +1533,7 @@ describe("quota.mjs", () => {
     });
 
     const geminiWin = usage.windows.find((w) => !w.aside && w.model === "gemini-4-neon");
-    assert.equal(geminiWin.used, 26);
+    assert.equal(geminiWin.used, 21);
 
     const aliceRow = usage.windows.find((w) => w.name === "Alice · FREE");
     assert.ok(aliceRow.display.includes("共享"));
@@ -1864,7 +2136,10 @@ describe("quota.mjs", () => {
 
     now += 11_000;
     const u2 = await getAgy2ApiUsage(opts);
-    assert.deepEqual(calls, ["/api/accounts/refresh", "/api/accounts", "/api/accounts"]);
+    assert.deepEqual(
+      calls.filter((p) => p !== "/api/settings"),
+      ["/api/accounts/refresh", "/api/accounts", "/api/accounts"],
+    );
     assert.match(u2.plan, /配额刷新失败/);
     assert.ok(u2.windows.some((w) => w.name === "状态" && /配额刷新失败/.test(w.display)));
 
@@ -2153,6 +2428,241 @@ describe("quota.mjs", () => {
     assert.ok(usage.windows.some((w) => w.name === "Acc B · FREE" && w.display === "待就绪"));
     assert.equal(usage.windows.some((w) => w.name === "Acc C · FREE"), false);
     assert.ok(usage.windows.some((w) => w.name === "其他账号" && w.display === "另有 1 个账号"));
+  });
+
+  it("filters by API_KEY_ACCOUNTS and /api/accounts/{id}/models, isolates variant vs bare cooldowns, respects QUOTA_RESERVE_PERCENT", async () => {
+    const nowMs = Date.parse("2026-11-24T10:00:00Z");
+    const root = "https://per-account.example.invalid";
+
+    const usage = await getAgy2ApiUsage({
+      baseUrl: root,
+      apiKey: "sk-bound",
+      refreshOnUsage: false,
+      showAccountDetails: true,
+      discoveredModels: {
+        "gemini-4-carbon": { id: "gemini-4-carbon", name: "Gemini 4 Carbon", family: "Gemini" },
+        "gemini-4-carbon-low": { id: "gemini-4-carbon-low", name: "Gemini 4 Carbon (Low)", family: "Gemini" },
+        "gemini-4-carbon-high": { id: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)", family: "Gemini" },
+        "alias-claude": { id: "alias-claude", name: "Alias Claude", family: "Claude" },
+      },
+      modelQuotaGroupMap: new Map([
+        ["gemini-4-carbon", "gemini"],
+        ["gemini-4-carbon-low", "gemini"],
+        ["gemini-4-carbon-high", "gemini"],
+        ["alias-claude", "3p"],
+      ]),
+      modelMetadataMap: new Map([
+        ["gemini-4-carbon", { thinkingLevels: ["low", "high"] }],
+        ["alias-claude", { isAlias: true, aliasTarget: "claude-opus-5-5", thinkingLevels: ["low", "high"] }],
+      ]),
+      nowFn: () => nowMs,
+      fetchImpl: async (url) => {
+        const p = new URL(url).pathname;
+        if (p === "/api/settings") {
+          return makeJsonResponse({
+            API_KEYS: "sk-bound,sk-other",
+            API_KEY_ACCOUNTS: "sk-bound:acc-1|acc-2",
+            MODEL_MAPPING: "alias-claude:claude-opus-5-5",
+            QUOTA_RESERVE_PERCENT: "10",
+          });
+        }
+        if (p === "/api/accounts") {
+          return makeJsonResponse({
+            accounts: [
+              {
+                id: "acc-1",
+                label: "Bound1",
+                state: "ready",
+                tier: "free-tier",
+                cooldown: { "gemini-4-carbon-low": "2026-11-24T11:00:00Z" },
+                quota_at: "2026-11-24T09:55:00Z",
+                quota: [
+                  { bucket_id: "gemini-5h", window: "5h", remaining_fraction: 0.8, reset_time: "2026-11-24T13:00:00Z" },
+                  { bucket_id: "3p-5h", window: "5h", remaining_fraction: 0.1, reset_time: "2026-11-24T13:00:00Z" },
+                ],
+              },
+              {
+                id: "acc-2",
+                label: "Bound2",
+                state: "ready",
+                tier: "free-tier",
+                cooldown: {
+                  "gemini-4-carbon-low": "2026-11-24T11:30:00Z",
+                  "gemini-4-carbon-high": "2026-11-24T12:00:00Z",
+                },
+                quota_at: "2026-11-24T09:55:00Z",
+                quota: [
+                  { bucket_id: "gemini-5h", window: "5h", remaining_fraction: 0.6, reset_time: "2026-11-24T13:00:00Z" },
+                  { bucket_id: "3p-5h", window: "5h", remaining_fraction: 0.9, reset_time: "2026-11-24T13:00:00Z" },
+                ],
+              },
+              {
+                id: "acc-3-unbound",
+                label: "Unbound3",
+                state: "ready",
+                tier: "g1-ultra-tier",
+                quota: [{ bucket_id: "gemini-5h", window: "5h", remaining_fraction: 1.0 }],
+              },
+            ],
+          });
+        }
+        if (p === "/api/accounts/acc-1/models") {
+          return makeJsonResponse({ models: [{ id: "gemini-4-carbon" }, { id: "claude-opus-5-5" }] });
+        }
+        if (p === "/api/accounts/acc-2/models") {
+          // acc-2 supports gemini-4-carbon (baseId matches variants too) but NOT claude-opus-5-5
+          return makeJsonResponse({ models: [{ id: "gemini-4-carbon" }] });
+        }
+        throw new Error(`Unexpected ${url}`);
+      },
+    });
+
+    // Unbound account excluded
+    assert.equal(usage.plan, "FREE ×2");
+    assert.equal(usage.windows.some((w) => w.name.includes("Unbound3")), false);
+
+    // gemini-4-carbon-low: BOTH acc-1 (11:00) and acc-2 (11:30) cooled -> used: 100, earliest 11:00
+    const lowWin = usage.windows.find((w) => !w.aside && w.model === "gemini-4-carbon-low");
+    assert.equal(lowWin.used, 100);
+    assert.equal(lowWin.resetsAt, "2026-11-24T11:00:00.000Z");
+
+    // gemini-4-carbon-high: acc-1 is NOT cooled (80% rem), acc-2 IS cooled (0% rem) -> avg 40% rem -> 60% used
+    const highWin = usage.windows.find((w) => !w.aside && w.model === "gemini-4-carbon-high");
+    assert.equal(highWin.used, 60);
+
+    // Bare gemini-4-carbon: acc-1 only has -low cooled (NOT -high) -> acc-1 NOT cooled (80% rem); acc-2 has ALL variants cooled -> avg 40% -> 60% used
+    const bareWin = usage.windows.find((w) => !w.aside && w.model === "gemini-4-carbon");
+    assert.equal(bareWin.used, 60);
+
+    // alias-claude -> claude-opus-5-5: only acc-1 supports it, and acc-1's 3p-5h is 10% <= QUOTA_RESERVE_PERCENT(10%) -> 100% used!
+    const aliasWin = usage.windows.find((w) => !w.aside && w.model === "alias-claude");
+    assert.equal(aliasWin.used, 100);
+  });
+
+  it("handles shared 7d vs independent 5h bottleneck, weekly span=604800, used=100 min(max) recovery, array failed, and stale cache age", async () => {
+    const nowMs = Date.parse("2026-11-24T10:00:00Z");
+
+    // 1. Non-shared A(5h=0, 7d=100) + B(5h=100, 7d=0) -> used: 100, min(max) recovery
+    const disJointUsage = computeAgy2ApiUsage(
+      [
+        {
+          id: "a@x",
+          state: "ready",
+          quota: [
+            { bucket_id: "gemini-5h", window: "5h", remaining_fraction: 0, reset_time: "2026-11-24T12:00:00Z" },
+            { bucket_id: "gemini-weekly", window: "weekly", remaining_fraction: 1, reset_time: "2026-11-30T00:00:00Z" },
+          ],
+        },
+        {
+          id: "b@x",
+          state: "ready",
+          quota: [
+            { bucket_id: "gemini-5h", window: "5h", remaining_fraction: 1, reset_time: "2026-11-24T15:00:00Z" },
+            { bucket_id: "gemini-weekly", window: "weekly", remaining_fraction: 0, reset_time: "2026-11-28T00:00:00Z" },
+          ],
+        },
+      ],
+      {
+        nowMs,
+        showAccountDetails: false,
+        discoveredModels: { "gemini-4-neon": { id: "gemini-4-neon" } },
+        modelQuotaGroupMap: new Map([["gemini-4-neon", "gemini"]]),
+      },
+    );
+    const djWin = disJointUsage.windows.find((w) => !w.aside && w.model === "gemini-4-neon");
+    assert.equal(djWin.used, 100);
+    assert.equal(djWin.resetsAt, "2026-11-24T12:00:00.000Z");
+    assert.equal(djWin.span, 18000);
+
+    // 2. Shared weekly A(5h=0, 7d=60) + B(5h=80, 7d=60) -> used: 40 (7d bottleneck span: 604800), 5h summary averages 0 and 80 (= 60% used)
+    const sharedUsage = computeAgy2ApiUsage(
+      [
+        {
+          id: "a@x",
+          state: "ready",
+          shared: { gemini: ["b@x"] },
+          quota: [
+            { bucket_id: "gemini-5h", window: "5h", remaining_fraction: 0, reset_time: "2026-11-24T12:00:00Z" },
+            { bucket_id: "gemini-weekly", window: "weekly", remaining_fraction: 0.6, reset_time: "2026-11-29T00:00:00Z" },
+          ],
+        },
+        {
+          id: "b@x",
+          state: "ready",
+          shared: { gemini: ["a@x"] },
+          quota: [
+            { bucket_id: "gemini-5h", window: "5h", remaining_fraction: 0.8, reset_time: "2026-11-24T13:00:00Z" },
+            { bucket_id: "gemini-weekly", window: "weekly", remaining_fraction: 0.6, reset_time: "2026-11-29T00:00:00Z" },
+          ],
+        },
+      ],
+      {
+        nowMs,
+        showAccountDetails: false,
+        discoveredModels: { "gemini-4-neon": { id: "gemini-4-neon" } },
+        modelQuotaGroupMap: new Map([["gemini-4-neon", "gemini"]]),
+      },
+    );
+    const shWin = sharedUsage.windows.find((w) => !w.aside && w.model === "gemini-4-neon");
+    assert.equal(shWin.used, 40);
+    assert.equal(shWin.span, 604800);
+    assert.equal(shWin.resetsAt, "2026-11-29T00:00:00.000Z");
+    const sum5h = sharedUsage.windows.find((w) => w.aside && w.name === "5 hours");
+    assert.equal(sum5h.used, 60);
+
+    // 3. Array `failed` + stale cache uses fetchedAt for expiration & marks aside:true after 60s
+    clearQuotaCache();
+    let now = Date.parse("2026-11-24T10:00:00Z");
+    let failGet = false;
+    const staleOpts = {
+      baseUrl: "https://stale-age.example.invalid",
+      cacheTtlSec: 5,
+      refreshCooldownSec: 120,
+      refreshOnUsage: true,
+      discoveredModels: { "gemini-4-neon": { id: "gemini-4-neon" } },
+      modelQuotaGroupMap: new Map([["gemini-4-neon", "gemini"]]),
+      nowFn: () => now,
+      fetchImpl: async (url) => {
+        const p = new URL(url).pathname;
+        if (p === "/api/accounts/refresh") {
+          return makeJsonResponse({
+            accounts: [
+              {
+                id: "a@x",
+                state: "ready",
+                quota: [
+                  {
+                    bucket_id: "gemini-5h",
+                    window: "5h",
+                    remaining_fraction: 0,
+                    reset_time: "2026-11-24T10:00:30Z",
+                  },
+                ],
+              },
+            ],
+            failed: ["bad1@x", "bad2@x"],
+          });
+        }
+        if (p === "/api/accounts" && failGet) {
+          return makeJsonResponse({ error: "down" }, 503);
+        }
+        return makeJsonResponse({ error: "not_found" }, 404);
+      },
+    };
+
+    const fresh = await getAgy2ApiUsage(staleOpts);
+    assert.match(fresh.plan, /部分配额刷新失败（2 个账号）/);
+    assert.equal(fresh.windows.find((w) => !w.aside && w.model === "gemini-4-neon").used, 100);
+
+    // Advance 90s (> 60s stale threshold, and past the 10:00:30 reset_time!) and fail GET
+    now += 90_000;
+    failGet = true;
+    const stale = await getAgy2ApiUsage(staleOpts);
+    assert.match(stale.plan, /旧缓存/);
+    // Evaluated at cached.fetchedAt (10:00:00 -> still 100% used, NOT falsely renewed!) AND marked aside: true (> 60s old)
+    const staleModelWin = stale.windows.find((w) => w.model === "gemini-4-neon");
+    assert.equal(staleModelWin.used, 100);
+    assert.equal(staleModelWin.aside, true);
   });
 });
 
@@ -3250,6 +3760,9 @@ describe("fetch.mjs", () => {
           ],
         });
       }
+      if (url.endsWith("/api/settings")) {
+        return makeJsonResponse({ error: "not_found" }, 404);
+      }
       sent.push({ headers: new Headers(init.headers), body: init.body });
       return makeJsonResponse({ ok: true });
     };
@@ -3501,6 +4014,570 @@ describe("fetch.mjs", () => {
       null,
     );
   });
+
+  it("handles session injection/stripping, subagent isolation, and responses previous_response_id protection across all 4 protocols + countTokens", async () => {
+    const sent = [];
+    const fetcher = createAgy2ApiFetch({
+      baseUrl: DEFAULT_BASE_URL,
+      apiKey: "sk-pub",
+      cacheAffinityMinBodyBytes: 64,
+      fetchImpl: async (url, init) => {
+        let parsed = null;
+        if (typeof init.body === "string") {
+          try {
+            parsed = JSON.parse(init.body);
+          } catch {
+            parsed = init.body;
+          }
+        }
+        sent.push({
+          url: String(url),
+          headers: new Headers(init.headers),
+          body: parsed,
+        });
+        return makeJsonResponse({ ok: true });
+      },
+    });
+
+    const bigText = "s".repeat(200);
+
+    // 1. Always strips internal headers (even on GET/non-gen) and injects x-session-id only when missing native session
+    await fetcher("http://localhost/v1/models", {
+      method: "GET",
+      headers: {
+        "x-magpie-session": "sess-main",
+        "x-magpie-subagent": "sub-1",
+        "x-agy2api-cache-session": "hash-1",
+        "x-magpie-effort": "high",
+        "x-magpie-custom": "drop-me",
+      },
+    });
+    assert.equal(sent[0].headers.get("x-magpie-session"), null);
+    assert.equal(sent[0].headers.get("x-magpie-subagent"), null);
+    assert.equal(sent[0].headers.get("x-agy2api-cache-session"), null);
+    assert.equal(sent[0].headers.get("x-magpie-effort"), null);
+    assert.equal(sent[0].headers.get("x-magpie-custom"), null);
+    assert.equal(sent[0].headers.get("x-session-id"), null);
+
+    // 2. Main session vs subagent isolation (both upstream x-session-id and local preserve_cache_effort)
+    await fetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-parent-1" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        reasoning_effort: "high",
+        max_completion_tokens: 32000,
+        messages: [{ role: "user", content: bigText }],
+      }),
+    });
+    assert.equal(sent[1].headers.get("x-session-id"), "magpie-parent-1");
+    assert.equal(sent[1].headers.get("x-magpie-session"), null);
+
+    await fetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-parent-1", "x-magpie-subagent": "explore-1" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        reasoning_effort: "low",
+        max_completion_tokens: 1024,
+        messages: [{ role: "user", content: bigText }, { role: "assistant", content: "hi" }],
+      }),
+    });
+    assert.match(sent[2].headers.get("x-session-id"), /^magpie-sub-v1-[0-9a-f]{32}$/);
+    assert.equal(sent[2].body.reasoning_effort, "low", "subagent must NOT inherit parent warm effort");
+
+    // 3. Same main session (no subagent) aux call DOES inherit parent warm effort and uses parent x-session-id
+    await fetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-parent-1" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        reasoning_effort: "low",
+        max_completion_tokens: 1024,
+        messages: [{ role: "user", content: bigText }, { role: "assistant", content: "hi" }],
+      }),
+    });
+    assert.equal(sent[3].headers.get("x-session-id"), "magpie-parent-1");
+    assert.equal(sent[3].body.reasoning_effort, "high");
+
+    // 4. Native session IDs: Anthropic JSON user_id, empty JSON session_id, plain user_id, count_tokens, countTokens
+    await fetcher("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-fallback" },
+      body: JSON.stringify({
+        model: "claude-opus-5-5",
+        metadata: { user_id: '{"session_id":"native-anth-json"}' },
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    assert.equal(sent[4].headers.get("x-session-id"), null);
+
+    await fetcher("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-fallback" },
+      body: JSON.stringify({
+        model: "claude-opus-5-5",
+        metadata: { user_id: '{"session_id":"   "}' },
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    assert.equal(sent[5].headers.get("x-session-id"), "magpie-fallback");
+
+    await fetcher("http://localhost/v1/messages/count_tokens", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-ct" },
+      body: JSON.stringify({
+        model: "claude-opus-5-5",
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    assert.equal(sent[6].headers.get("x-session-id"), "magpie-ct");
+
+    await fetcher("http://localhost/v1beta/models/gemini-4-neon:countTokens", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-gem-ct" },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+    });
+    assert.equal(sent[7].headers.get("x-session-id"), "magpie-gem-ct");
+
+    // 5. Responses previous_response_id without native session must NOT inject x-session-id
+    await fetcher("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-resp" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        previous_response_id: "resp_abc123",
+        input: "continue",
+      }),
+    });
+    assert.equal(sent[8].headers.get("x-session-id"), null);
+
+    // 6. Malformed JSON POST body for anthropic/chat/responses must NOT inject x-session-id
+    await fetcher("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-bad-json" },
+      body: "{bad json",
+    });
+    assert.equal(sent[9].headers.get("x-session-id"), null);
+
+    // 7. chat prompt_cache_key counts as native session
+    await fetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-ignored" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        prompt_cache_key: "pck-1",
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    assert.equal(sent[10].headers.get("x-session-id"), null);
+  });
+
+  it("handles preserve_cache_effort edge cases: LRU eviction race guard, tools fingerprint, single/same physical variant skip, includeThoughts:false, between_tools, configuration_update, header slot", async () => {
+    const sent = [];
+    const resolvers = [];
+    let delayResponses = false;
+    const fetchImpl = (url, init) => {
+      const u = String(url);
+      if (u.endsWith("/api/models")) {
+        return Promise.resolve(
+          makeJsonResponse({
+            models: [
+              {
+                id: "gemini-4-carbon",
+                provider: "MODEL_PROVIDER_GOOGLE",
+                thinking_levels: ["low", "medium", "high"],
+                capabilities: { thinking: true },
+              },
+              {
+                id: "gpt-single",
+                provider: "MODEL_PROVIDER_OPENAI",
+                thinking_levels: ["medium"],
+                capabilities: { thinking: true },
+              },
+              {
+                id: "gemini-4-neon",
+                provider: "MODEL_PROVIDER_GOOGLE",
+                thinking_levels: ["low", "medium", "high", "xhigh"],
+                capabilities: { thinking: true },
+              },
+            ],
+          }),
+        );
+      }
+      if (u.endsWith("/api/settings")) {
+        return Promise.resolve(makeJsonResponse({ error: "not_found" }, 404));
+      }
+      sent.push(JSON.parse(init.body));
+      if (delayResponses) {
+        return new Promise((resolve) => {
+          resolvers.push(() => resolve(makeJsonResponse({ ok: true })));
+        });
+      }
+      return Promise.resolve(makeJsonResponse({ ok: true }));
+    };
+
+    const { ensureModelsDiscovered } = await import("../lib/models.mjs");
+    await ensureModelsDiscovered(DEFAULT_BASE_URL, "sk-pub", { fetchImpl });
+
+    const fetcher = createAgy2ApiFetch({
+      baseUrl: DEFAULT_BASE_URL,
+      apiKey: "sk-pub",
+      cacheAffinityMinBodyBytes: 64,
+      fetchImpl,
+    });
+    const bigText = "p".repeat(200);
+
+    // 1. Out-of-order slow main request cannot overwrite newer main request EVEN AFTER >256 entries evict cache!
+    delayResponses = true;
+    const pSlow = fetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-session-id": "evict-race" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        reasoning_effort: "xhigh",
+        max_completion_tokens: 32000,
+        messages: [{ role: "user", content: bigText }],
+      }),
+    });
+    const pFast = fetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-session-id": "evict-race" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        reasoning_effort: "medium",
+        max_completion_tokens: 32000,
+        messages: [{ role: "user", content: bigText }, { role: "assistant", content: "ok" }],
+      }),
+    });
+    await Promise.resolve();
+    resolvers[1](); // fast (medium) completes first
+    await pFast;
+
+    // Evict all 256 cache entries while pSlow is STILL in flight!
+    delayResponses = false;
+    for (let i = 0; i < 260; i++) {
+      await fetcher("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "x-session-id": `evict-filler-${i}` },
+        body: JSON.stringify({
+          model: "gpt-oss-120b",
+          reasoning_effort: "high",
+          max_completion_tokens: 32000,
+          messages: [{ role: "user", content: bigText }],
+        }),
+      });
+    }
+    resolvers[0](); // slow (xhigh) completes AFTER eviction
+    await pSlow;
+
+    // Aux request for evict-race must NOT see stale xhigh from pSlow!
+    await fetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-session-id": "evict-race" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        reasoning_effort: "low",
+        max_completion_tokens: 1024,
+        messages: [{ role: "user", content: bigText }, { role: "assistant", content: "ok2" }],
+      }),
+    });
+    assert.equal(sent[sent.length - 1].reasoning_effort, "low");
+
+    // 2. Tools prefix differentiation
+    await fetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-session-id": "tools-sess" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        reasoning_effort: "high",
+        max_completion_tokens: 32000,
+        tools: [{ type: "function", function: { name: "read_file" } }],
+        messages: [{ role: "user", content: bigText }],
+      }),
+    });
+    await fetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-session-id": "tools-sess" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        reasoning_effort: "low",
+        max_completion_tokens: 1024,
+        tools: [{ type: "function", function: { name: "different_tool" } }],
+        messages: [{ role: "user", content: bigText }, { role: "assistant", content: "ok" }],
+      }),
+    });
+    assert.equal(sent[sent.length - 1].reasoning_effort, "low");
+
+    // 3. Single physical model & same physical effective variant (xhigh vs high on gemini-4-carbon) & -tiered suffix skip
+    await fetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-session-id": "single-phys" },
+      body: JSON.stringify({
+        model: "gpt-single",
+        reasoning_effort: "high",
+        max_completion_tokens: 32000,
+        messages: [{ role: "user", content: bigText }],
+      }),
+    });
+    await fetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-session-id": "single-phys" },
+      body: JSON.stringify({
+        model: "gpt-single",
+        reasoning_effort: "low",
+        max_completion_tokens: 1024,
+        messages: [{ role: "user", content: bigText }],
+      }),
+    });
+    assert.equal(sent[sent.length - 1].reasoning_effort, "low");
+
+    // gemini-4-carbon only has ["low","medium","high"]: warm xhigh vs aux high -> same physical variant -> NOT rewritten to "xhigh"
+    await fetcher("http://localhost/v1beta/models/gemini-4-carbon:generateContent", {
+      method: "POST",
+      headers: { "x-session-id": "same-phys" },
+      body: JSON.stringify({
+        generationConfig: {
+          maxOutputTokens: 32000,
+          responseMimeType: "application/json",
+          responseSchema: { type: "OBJECT" },
+          thinkingConfig: { thinkingLevel: "xhigh", includeThoughts: false },
+        },
+        contents: [{ role: "user", parts: [{ text: bigText }] }],
+      }),
+    });
+    await fetcher("http://localhost/v1beta/models/gemini-4-carbon:generateContent", {
+      method: "POST",
+      headers: { "x-session-id": "same-phys" },
+      body: JSON.stringify({
+        generationConfig: {
+          maxOutputTokens: 1024,
+          responseMimeType: "application/json",
+          responseSchema: { type: "OBJECT" },
+          thinkingConfig: { thinkingLevel: "high", includeThoughts: false },
+        },
+        contents: [{ role: "user", parts: [{ text: bigText }] }],
+      }),
+    });
+    assert.equal(sent[sent.length - 1].generationConfig.thinkingConfig.thinkingLevel, "high");
+
+    // Same session with aux "low" and includeThoughts:false DOES rewrite to warm "xhigh" while preserving includeThoughts:false & responseSchema!
+    await fetcher("http://localhost/v1beta/models/gemini-4-carbon:generateContent", {
+      method: "POST",
+      headers: { "x-session-id": "same-phys" },
+      body: JSON.stringify({
+        generationConfig: {
+          maxOutputTokens: 1024,
+          responseMimeType: "application/json",
+          responseSchema: { type: "OBJECT" },
+          thinkingConfig: { thinkingLevel: "low", includeThoughts: false },
+        },
+        contents: [{ role: "user", parts: [{ text: bigText }] }],
+      }),
+    });
+    assert.equal(sent[sent.length - 1].generationConfig.thinkingConfig.thinkingLevel, "xhigh");
+    assert.equal(sent[sent.length - 1].generationConfig.thinkingConfig.includeThoughts, false);
+    assert.deepEqual(sent[sent.length - 1].generationConfig.responseSchema, { type: "OBJECT" });
+
+    // 4. Anthropic between_tools & Responses configuration_update & Responses top-level reasoning_effort ignored & header slot no body injection
+    await fetcher("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "x-session-id": "anth-bt" },
+      body: JSON.stringify({
+        model: "claude-opus-5-5",
+        max_tokens: 32000,
+        output_config: { effort: "high" },
+        messages: [{ role: "user", content: bigText }],
+      }),
+    });
+    await fetcher("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "x-session-id": "anth-bt" },
+      body: JSON.stringify({
+        model: "claude-opus-5-5",
+        max_tokens: 1024,
+        thinking: { type: "between_tools" },
+        output_config: { effort: "low" },
+        messages: [{ role: "user", content: bigText }],
+      }),
+    });
+    assert.equal(sent[sent.length - 1].output_config.effort, "low");
+
+    await fetcher("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "x-session-id": "resp-cfg" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        reasoning: { effort: "high" },
+        max_output_tokens: 32000,
+        input: [{ role: "user", content: bigText }],
+      }),
+    });
+    // configuration_update skipped
+    await fetcher("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "x-session-id": "resp-cfg" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        reasoning: { effort: "low" },
+        max_output_tokens: 1024,
+        input: [{ role: "user", content: bigText }, { type: "configuration_update" }],
+      }),
+    });
+    assert.equal(sent[sent.length - 1].reasoning.effort, "low");
+
+    // Top-level reasoning_effort on responses is ignored (not rewritten)
+    await fetcher("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "x-session-id": "resp-cfg" },
+      body: JSON.stringify({
+        model: "gpt-oss-120b",
+        reasoning_effort: "low",
+        max_output_tokens: 1024,
+        input: [{ role: "user", content: bigText }],
+      }),
+    });
+    assert.equal(sent[sent.length - 1].reasoning_effort, "low");
+    assert.equal(sent[sent.length - 1].reasoning, undefined);
+
+    // 5. preserveCacheEffort: false skips prefix cache completely while Gemini xhigh passthrough still works
+    const noPresFetcher = createAgy2ApiFetch({
+      baseUrl: DEFAULT_BASE_URL,
+      apiKey: "sk-pub",
+      preserveCacheEffort: false,
+      cacheAffinityMinBodyBytes: 64,
+      fetchImpl,
+    });
+    await noPresFetcher("http://localhost/v1beta/models/gemini-4-neon:generateContent", {
+      method: "POST",
+      headers: { "x-magpie-effort": "xhigh" },
+      body: JSON.stringify({
+        generationConfig: { thinkingConfig: { thinkingLevel: "high" } },
+        contents: [{ role: "user", parts: [{ text: bigText }] }],
+      }),
+    });
+    assert.equal(sent[sent.length - 1].generationConfig.thinkingConfig.thinkingLevel, "xhigh");
+  });
+
+  it("normalizes 502 content policy, 401 kept/expired & 400 API_KEY_INVALID, 429 CooldownError/upstream 429, and 404 model_not_found", async () => {
+    // 1. 502 content policy across OpenAI, Anthropic, Gemini
+    const norm502Oai = normalizeUpstreamErrorResponse(
+      JSON.stringify({
+        error: {
+          code: "upstream_502",
+          message: "Internal server error: Upstream stopped generation due to content policy: PROHIBITED",
+        },
+      }),
+      502,
+      "gpt-oss-120b",
+    );
+    const o502 = JSON.parse(norm502Oai.body);
+    assert.equal(o502.error.code, "content_policy_violation");
+    assert.equal(o502.error.upstream_code, "upstream_502");
+
+    const norm502Anth = normalizeUpstreamErrorResponse(
+      JSON.stringify({
+        type: "error",
+        error: { type: "api_error", message: "Upstream stopped generation due to content policy: SAFETY" },
+      }),
+      502,
+      "claude-opus-5-5",
+    );
+    assert.equal(JSON.parse(norm502Anth.body).error.code, "content_policy_violation");
+
+    const norm502Gem = normalizeUpstreamErrorResponse(
+      JSON.stringify({
+        error: { code: 502, status: "INTERNAL", message: "Upstream stopped generation due to content policy: BLOCKLIST" },
+      }),
+      502,
+      "gemini-4-neon",
+    );
+    assert.equal(JSON.parse(norm502Gem.body).error.type, "content_policy_violation");
+
+    // 2. 401 kept vs expired & Gemini 400 API_KEY_INVALID via fetch
+    const respQueue = [];
+    const errFetcher = createAgy2ApiFetch({
+      baseUrl: DEFAULT_BASE_URL,
+      apiKey: "sk-pub",
+      fetchImpl: async () => respQueue.shift(),
+    });
+
+    respQueue.push(
+      makeJsonResponse({ error: { message: "Authentication failed: upstream 401 UNAUTHENTICATED" } }, 401),
+      makeJsonResponse({ error: { code: "invalid_api_key", message: "bad" } }, 401),
+      makeJsonResponse({ error: { message: "Invalid API Key" } }, 401),
+      new Response("plain unauthorized", { status: 401, headers: { "content-type": "text/plain" } }),
+      makeJsonResponse({ error: { code: 400, details: [{ reason: "API_KEY_INVALID" }] } }, 400),
+      makeJsonResponse(
+        { error: { message: "No available accounts for model gemini-4-argon-high" } },
+        429,
+        { "retry-after": "33" },
+      ),
+      makeJsonResponse({ error: { message: "Rate limit exceeded: upstream 429 Too Many Requests" } }, 429),
+      makeJsonResponse({ error: { message: "Model gemini-4-argon-high is not in the account catalog" } }, 404),
+      makeJsonResponse({ error: { code: "model_not_found", message: "unknown" } }, 404),
+    );
+
+    const r401Upstream = await errFetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-oss-120b", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(r401Upstream.status, 401);
+    assert.equal(r401Upstream.headers.get("x-magpie-sign-in"), "kept");
+
+    const r401ExpiredCode = await errFetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-oss-120b", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(r401ExpiredCode.headers.get("x-magpie-sign-in"), "expired");
+
+    const r401ExpiredMsg = await errFetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-oss-120b", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(r401ExpiredMsg.headers.get("x-magpie-sign-in"), "expired");
+
+    const r401Plain = await errFetcher("http://localhost/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-oss-120b", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(r401Plain.headers.get("x-magpie-sign-in"), "kept");
+    assert.equal(await r401Plain.text(), "plain unauthorized");
+
+    const r400GemKey = await errFetcher("http://localhost/v1beta/models/gemini-4-neon:generateContent", {
+      method: "POST",
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+    });
+    assert.equal(r400GemKey.headers.get("x-magpie-sign-in"), "expired");
+
+    const r429Cool = await errFetcher("http://localhost/v1beta/models/gemini-4-argon:generateContent", {
+      method: "POST",
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+    });
+    assert.equal(r429Cool.headers.get("retry-after"), "33");
+    const j429Cool = await r429Cool.json();
+    assert.equal(j429Cool.error.model, "gemini-4-argon");
+    assert.equal(hasWholeModelToken(j429Cool.error.message, "gemini-4-argon"), true);
+
+    const r429Up = await errFetcher("http://localhost/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "claude-opus-5-5", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal((await r429Up.json()).error.model, "claude-opus-5-5");
+
+    const r404Catalog = await errFetcher("http://localhost/v1beta/models/gemini-4-argon:countTokens", {
+      method: "POST",
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+    });
+    const j404Catalog = await r404Catalog.json();
+    assert.equal(j404Catalog.error.model, "gemini-4-argon");
+    assert.match(j404Catalog.error.message, /^model gemini-4-argon not found:/);
+
+    // Non-model endpoint 404 is NOT rewritten
+    const r404NonModel = await errFetcher("http://localhost/v1/models", { method: "GET" });
+    const j404NonModel = await r404NonModel.json();
+    assert.equal(j404NonModel.error.message, "unknown");
+  });
 });
 
 describe("index.mjs plugin entrypoint", () => {
@@ -3536,6 +4613,8 @@ describe("index.mjs plugin entrypoint", () => {
     const promptKeys = hooks.auth.methods[0].prompts.map((p) => p.key);
     assert.deepEqual(promptKeys, ["baseUrl", "adminUsername", "adminPassword"]);
     assert.equal(hooks.auth.methods[0].prompts[0].default, "http://127.0.0.1:8017");
+    const foldOpt = hooks.auth.options.find((o) => o.key === "fold_effort_variants");
+    assert.equal(foldOpt?.filtersModels, true);
 
     const cfg = {};
     await hooks.config(cfg);
@@ -3776,7 +4855,7 @@ describe("index.mjs plugin entrypoint", () => {
       assert.ok(models["gemini-prio"]);
       assert.equal(models["gemini-prio-low"], undefined);
 
-      // 3. Slow (18ms) preserve_cache_effort: false read ONCE in loader is awaited and fixed for inference (no per-request re-reads)
+      // 3. Hot-reloadable preserve_cache_effort: starts false (no rewrite/warm), then dynamically flips true without recreating loader
       let optionReads = 0;
       let slowOptValue = false;
       const slowBodies = [];
@@ -3800,7 +4879,6 @@ describe("index.mjs plugin entrypoint", () => {
         key: "sk-slow",
         metadata: { baseUrl: "https://slow-opts.example.invalid" },
       }));
-      const readsAtLoad = optionReads;
       const bigPad = "p".repeat(36 * 1024);
       await slowLoaded.fetch("https://slow-opts.example.invalid/v1/chat/completions", {
         method: "POST",
@@ -3822,8 +4900,135 @@ describe("index.mjs plugin entrypoint", () => {
           messages: [{ role: "user", content: bigPad }, { role: "user", content: "aux" }],
         }),
       });
-      assert.equal(optionReads, readsAtLoad);
+      assert.equal(optionReads, 2);
       assert.equal(slowBodies[1].reasoning_effort, "low");
+
+      slowOptValue = true;
+      await slowLoaded.fetch("https://slow-opts.example.invalid/v1/chat/completions", {
+        method: "POST",
+        headers: { "x-session-id": "slow-sess" },
+        body: JSON.stringify({
+          model: "gpt-oss",
+          reasoning_effort: "high",
+          max_completion_tokens: 32000,
+          messages: [{ role: "user", content: bigPad }],
+        }),
+      });
+      await slowLoaded.fetch("https://slow-opts.example.invalid/v1/chat/completions", {
+        method: "POST",
+        headers: { "x-session-id": "slow-sess" },
+        body: JSON.stringify({
+          model: "gpt-oss",
+          reasoning_effort: "low",
+          max_completion_tokens: 2048,
+          messages: [{ role: "user", content: bigPad }, { role: "user", content: "aux" }],
+        }),
+      });
+      assert.equal(optionReads, 4);
+      assert.equal(slowBodies[3].reasoning_effort, "high");
+
+      // 4. Cold-start usage() (before provider.models) triggers ensureModelsDiscovered and passes apiKey
+      clearModelCache();
+      clearQuotaCache();
+      const coldUrls = [];
+      globalThis.fetch = async (url) => {
+        const p = new URL(url).pathname;
+        coldUrls.push(p);
+        if (p === "/api/models") {
+          return makeJsonResponse({
+            models: [
+              {
+                id: "gemini-cold",
+                name: "Gemini Cold",
+                provider: "MODEL_PROVIDER_GOOGLE",
+                quota_group: "gemini",
+              },
+              {
+                id: "my-cold",
+                name: "My Cold Alias",
+                provider: "MODEL_PROVIDER_GOOGLE",
+              },
+            ],
+          });
+        }
+        if (p === "/api/settings") {
+          return makeJsonResponse({
+            values: {
+              API_KEYS: "sk-cold",
+              API_KEY_ACCOUNTS: "sk-cold:Cold-Acc",
+              MODEL_MAPPING: "my-cold:gemini-cold",
+              QUOTA_RESERVE_PERCENT: "0",
+            },
+            admin_password_set: true,
+          });
+        }
+        if (p === "/api/accounts/refresh") {
+          return makeJsonResponse({
+            accounts: [
+              {
+                id: "Cold-Acc",
+                state: "ready",
+                tier: "free-tier",
+                quota: [{ bucket_id: "gemini-5h", window: "5h", remaining_fraction: 0.7 }],
+              },
+              {
+                id: "cold-acc",
+                state: "ready",
+                tier: "g1-pro-tier",
+                quota: [{ bucket_id: "gemini-5h", window: "5h", remaining_fraction: 0.1 }],
+              },
+              {
+                id: "other-acc",
+                state: "ready",
+                tier: "g1-ultra-tier",
+                quota: [{ bucket_id: "gemini-5h", window: "5h", remaining_fraction: 1.0 }],
+              },
+            ],
+            failed: {},
+          });
+        }
+        if (p === "/api/accounts") {
+          return makeJsonResponse({
+            accounts: [
+              {
+                id: "Cold-Acc",
+                state: "ready",
+                tier: "free-tier",
+                quota: [{ bucket_id: "gemini-5h", window: "5h", remaining_fraction: 0.7 }],
+              },
+              {
+                id: "cold-acc",
+                state: "ready",
+                tier: "g1-pro-tier",
+                quota: [{ bucket_id: "gemini-5h", window: "5h", remaining_fraction: 0.1 }],
+              },
+              {
+                id: "other-acc",
+                state: "ready",
+                tier: "g1-ultra-tier",
+                quota: [{ bucket_id: "gemini-5h", window: "5h", remaining_fraction: 1.0 }],
+              },
+            ],
+          });
+        }
+        throw new Error(`Unexpected ${url}`);
+      };
+      const coldUsage = await hooksSlow.auth.usage(async () => ({
+        key: "sk-cold",
+        metadata: { baseUrl: "https://cold-usage.example.invalid" },
+      }));
+      assert.ok(coldUrls.includes("/api/models"));
+      assert.equal(coldUsage.plan, "FREE ×1");
+      assert.equal(coldUsage.windows.find((w) => !w.aside && w.model === "gemini-cold")?.used, 30);
+      assert.equal(coldUsage.windows.find((w) => !w.aside && w.model === "my-cold")?.used, 30);
+
+      // chat.headers also supports agy2api-plugin
+      const pluginHdrOut = { headers: {} };
+      await hooksSlow["chat.headers"](
+        { model: { providerID: "agy2api-plugin" }, sessionID: "sess-p" },
+        pluginHdrOut,
+      );
+      assert.match(pluginHdrOut.headers["x-agy2api-cache-session"], /^[0-9a-f]{64}$/);
     } finally {
       globalThis.fetch = origFetch;
     }

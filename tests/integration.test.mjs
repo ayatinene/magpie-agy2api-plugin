@@ -581,4 +581,73 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
       assert.ok(js.includes(JSON.stringify(rule.pattern)), `panel preset rules missing pattern for ${rule.id}`);
     }
   });
+
+  it("middleware.mjs delegates plugin account requests to single-pass fetch.mjs sanitization while supporting agy2api-plugin and non-plugin custom providers", async () => {
+    const rawBody = {
+      model: "claude-opus-5-5",
+      max_tokens: 4096,
+      system: [
+        { type: "text", text: "x-anthropic-billing-header: cc_version=2.1;" },
+        { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      ],
+      messages: [{ role: "user", content: "hello" }],
+    };
+
+    // 1. account === "plugin" skips onProvider (both agy2api and agy2api-plugin), unless forceMiddlewareOnPlugin: true
+    assert.equal(
+      onProvider(rawBody, {
+        protocol: "anthropic",
+        provider: { id: "agy2api", account: "plugin" },
+      }),
+      undefined,
+    );
+    assert.equal(
+      onProvider(rawBody, {
+        protocol: "anthropic",
+        provider: { id: "agy2api-plugin", account: "plugin" },
+      }),
+      undefined,
+    );
+    const forced = onProvider(rawBody, {
+      protocol: "anthropic",
+      provider: { id: "agy2api-plugin", account: "plugin" },
+      options: { forceMiddlewareOnPlugin: true },
+    });
+    assert.ok(forced);
+
+    // 2. Non-plugin account (direct custom provider or tests) still runs onProvider for both agy2api and agy2api-plugin
+    const customOut = onProvider(rawBody, {
+      protocol: "anthropic",
+      provider: { id: "agy2api-plugin" },
+    });
+    assert.ok(customOut);
+    assert.equal(JSON.stringify(customOut).includes("You are Antigravity"), true);
+
+    // 3. End-to-end single pass: middleware skips account:"plugin", fetch.mjs performs the sole sanitization pass
+    const sentBodies = [];
+    const agyFetch = createAgy2ApiFetch({
+      baseUrl: "http://127.0.0.1:8017",
+      apiKey: "sk-test",
+      fetchImpl: async (_url, init) => {
+        sentBodies.push(JSON.parse(init.body));
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    const mwResult = onProvider(rawBody, {
+      protocol: "anthropic",
+      provider: { id: "agy2api", account: "plugin" },
+    });
+    assert.equal(mwResult, undefined);
+    await agyFetch("http://127.0.0.1:8017/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(mwResult ?? rawBody),
+    });
+    assert.equal(sentBodies.length, 1);
+    assert.equal(JSON.stringify(sentBodies[0]).includes("x-anthropic-billing-header"), false);
+    assert.equal(JSON.stringify(sentBodies[0]).includes("You are Antigravity"), true);
+  });
 });
