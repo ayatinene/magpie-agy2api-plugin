@@ -5,7 +5,8 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { onProvider } from "../middleware.mjs";
+import { onRequest as hookOnRequest, onResponse as hookOnResponse } from "../hooks.mjs";
+import { onProvider, onRequest as mwOnRequest } from "../middleware.mjs";
 import { RECOMMENDED_PRESET_RULES, SIDELOAD_OPEN_TAG } from "../lib/sanitizer.mjs";
 import plugin from "../index.mjs";
 import { clearAdminSessionCache } from "../lib/auth.mjs";
@@ -649,5 +650,134 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
     assert.equal(sentBodies.length, 1);
     assert.equal(JSON.stringify(sentBodies[0]).includes("x-anthropic-billing-header"), false);
     assert.equal(JSON.stringify(sentBodies[0]).includes("You are Antigravity"), true);
+  });
+
+  it("wires hooks.mjs in package.json and completes hooks.onRequest -> middleware.onRequest -> agy2apiFetch -> hooks.onResponse end-to-end", async () => {
+    clearPrefixEffortCache();
+    clearModelCache();
+
+    const pkg = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "package.json"), "utf8"));
+    assert.equal(pkg.magpie?.hooks, "./hooks.mjs");
+    assert.equal(pkg.magpie?.options?.auxIncompatiblePolicy, "current_low");
+    assert.equal(pkg.magpie?.options?.auxFallbackModel, "");
+    assert.equal(pkg.magpie?.options?.auxFallbackEffort, "low");
+
+    const relaySecret = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const upstreamSent = [];
+    const mockFetch = async (url, init) => {
+      if (String(url).endsWith("/api/models")) {
+        return new Response(
+          JSON.stringify({
+            models: [
+              {
+                id: "claude-opus-5-5",
+                name: "Claude Opus 5.5",
+                provider: "MODEL_PROVIDER_ANTHROPIC",
+                quota_group: "3p",
+                thinking_levels: ["low", "medium", "high"],
+                capabilities: { thinking: true, images: true },
+              },
+              {
+                id: "gemini-3.8-flash",
+                name: "Gemini 3.8 Flash",
+                provider: "MODEL_PROVIDER_GOOGLE",
+                quota_group: "gemini",
+                thinking_levels: ["low", "medium", "high"],
+                capabilities: { thinking: true, images: true },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      upstreamSent.push({
+        url: String(url),
+        headers: new Headers(init.headers),
+        body: JSON.parse(init.body),
+      });
+      return new Response(JSON.stringify({ id: "msg_1", content: [{ type: "text", text: "ok" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    await ensureModelsDiscovered("http://127.0.0.1:8017", "sk-int", { fetchImpl: mockFetch });
+    const agyFetch = createAgy2ApiFetch({
+      baseUrl: "http://127.0.0.1:8017",
+      apiKey: "sk-int",
+      fetchImpl: mockFetch,
+    });
+
+    const mainBody = {
+      model: "claude-opus-5-5",
+      max_tokens: 64000,
+      system: [{ type: "text", text: `Main instructions\n${LARGE_PADDING}` }],
+      messages: [{ role: "user", content: "<system-reminder>Env</system-reminder>\nAnalyze module" }],
+      output_config: { effort: "high" },
+      metadata: { user_id: '{"session_id":"int-main-1"}' },
+    };
+
+    const st = {};
+    await hookOnRequest(mainBody, {
+      protocol: "anthropic",
+      session: "int-main-1",
+      path: "/v1/messages",
+      state: st,
+      options: { relaySecret },
+    });
+    await agyFetch("http://127.0.0.1:8017/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-session-id": "int-main-1" },
+      body: JSON.stringify(mainBody),
+    });
+    await hookOnResponse({ content: [{ type: "text", text: "Analyzed module." }] }, { success: true, state: st });
+
+    // Incompatible aux call (post-turn-1 reply matches mainState via onResponse fingerprint, m0 stripped <system-reminder>)
+    const auxBody = {
+      model: "claude-opus-5-5",
+      max_tokens: 4096,
+      system: mainBody.system,
+      messages: [
+        { role: "user", content: "Analyze module" },
+        { role: "assistant", content: "Analyzed module." },
+        { role: "user", content: "Extract memories" },
+      ],
+      output_config: { effort: "low" },
+      metadata: { user_id: '{"session_id":"int-main-1"}' },
+    };
+    const hookOut = await hookOnRequest(auxBody, {
+      protocol: "anthropic",
+      session: "int-main-1",
+      path: "/v1/messages",
+      options: {
+        relaySecret,
+        auxIncompatiblePolicy: "fallback_model",
+        auxFallbackModel: "gemini-3.8-flash",
+        auxFallbackEffort: "low",
+      },
+    });
+    assert.ok(hookOut?._agy2api_relay);
+
+    const mwOut = mwOnRequest(hookOut, {
+      protocol: "anthropic",
+      options: { relaySecret },
+    });
+    assert.equal(mwOut.model, "agy2api/gemini-3.8-flash");
+    assert.equal("_agy2api_relay" in mwOut, false);
+
+    // Simulate Magpie routing agy2api/gemini-3.8-flash -> agy2api provider fetch (bare model)
+    await agyFetch("http://127.0.0.1:8017/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-session-id": "int-main-1" },
+      body: JSON.stringify({ ...mwOut, model: "gemini-3.8-flash" }),
+    });
+
+    assert.equal(upstreamSent.length, 2);
+    assert.equal(upstreamSent[1].body.model, "gemini-3.8-flash");
+    assert.match(upstreamSent[1].headers.get("x-session-id"), /^agy2api-aux-v1-[0-9a-f]{32}$/);
+    assert.match(
+      JSON.parse(upstreamSent[1].body.metadata.user_id).session_id,
+      /^agy2api-aux-v1-[0-9a-f]{32}$/,
+    );
   });
 });

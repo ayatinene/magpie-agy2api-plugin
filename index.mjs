@@ -1,6 +1,11 @@
 import crypto from "node:crypto";
 import { DEFAULT_BASE_URL, normalizeBaseUrl, resolveAuth } from "./lib/auth.mjs";
 import {
+  ensureRelaySecret,
+  registerAuthScope,
+  setPluginRuntimeContext,
+} from "./lib/aux-router.mjs";
+import {
   ensureModelsDiscovered,
   getDiscoveredModels,
   getModelMetadataMap,
@@ -163,6 +168,13 @@ async function startPageServiceWhenFree(port) {
 }
 
 async function server(input, options) {
+  ensureRelaySecret({ options });
+  setPluginRuntimeContext({
+    directory: input?.directory,
+    magpie: input?.magpie,
+    staticOptions: options,
+  });
+
   if (options?.disablePageService === true) {
     pageServiceRun += 1;
     await stopPageService().catch(() => {});
@@ -183,6 +195,7 @@ async function server(input, options) {
       const existing = cfg.provider.agy2api ?? {};
       const baseUrl = normalizeBaseUrl(existing.api || DEFAULT_BASE_URL);
       configuredBaseUrl = baseUrl;
+      setPluginRuntimeContext({ defaultBaseUrl: baseUrl });
       cfg.provider.agy2api = {
         ...existing,
         name: existing.name || "Antigravity2API",
@@ -218,6 +231,9 @@ async function server(input, options) {
           typeof provider?.api === "string" && provider.api.trim()
             ? normalizeBaseUrl(provider.api)
             : configuredBaseUrl;
+        if (ctx?.auth && typeof ctx.auth === "object") {
+          registerAuthScope(resolveAuth(ctx.auth, { defaultBaseUrl: fallbackBaseUrl }));
+        }
         return reconcileModels(provider, ctx, {
           foldEffortVariants: live.foldEffortVariants,
           defaultBaseUrl: fallbackBaseUrl,
@@ -262,14 +278,15 @@ async function server(input, options) {
         },
         {
           key: "preserve_cache_effort",
-          label: "Preserve session effort for cache hits",
-          labels: { zh: "后台降档对齐会话档位（保缓存）" },
+          label: "Preserve cache effort & auxiliary routing",
+          labels: { zh: "缓存档位对齐与辅助请求路由（总开关）" },
           description:
-            "Keep warm-prefix auxiliary requests (lowered effort with capped max output tokens) on the session's active effort level to avoid cross-model prompt cache misses.",
+            "Master switch for warm-prefix effort alignment, cache-aware auxiliary request routing, and incompatible auxiliary session isolation (turning this off also disables aux_* policies).",
           descriptions: {
-            zh: "命中热缓存前缀的后台辅助请求同时降低思考档位并收紧最大输出上限时，自动对齐回会话当前档位，避免跨上游模型 ID 击穿缓存。",
+            zh: "热缓存前缀思考档位对齐、缓存感知辅助请求路由与不兼容辅助会话隔离的统一总开关（关闭时同步停用全部 aux_* 辅助策略）。",
           },
-          default: true,
+          default:
+            tryCoerceBool(options?.preserve_cache_effort ?? options?.preserveCacheEffort) ?? true,
         },
       ],
       methods: [
@@ -317,6 +334,7 @@ async function server(input, options) {
         const { apiKey, baseUrl, adminUsername, adminPassword } = resolveAuth(auth, {
           defaultBaseUrl: fallbackBaseUrl,
         });
+        registerAuthScope({ baseUrl, apiKey, adminUsername, adminPassword });
         return {
           apiKey,
           baseURL: baseUrl,
@@ -349,6 +367,7 @@ async function server(input, options) {
           defaultBaseUrl: fallbackBaseUrl,
         });
         const authScope = { baseUrl, apiKey, adminUsername, adminPassword };
+        registerAuthScope(authScope);
         const live = await readLiveOptions(input, options);
         if (!getDiscoveredModels(authScope)) {
           await ensureModelsDiscovered(authScope, undefined, {

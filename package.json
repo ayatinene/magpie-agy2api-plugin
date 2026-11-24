@@ -20,6 +20,7 @@
   "magpie": {
     "name": "Antigravity2API",
     "middleware": "./middleware.mjs",
+    "hooks": "./hooks.mjs",
     "icon": "https://raw.githubusercontent.com/Mag1cFall/Antigravity2API/main/web/src/assets/logo.png",
     "page": {
       "title": "Prompt Sanitizer",
@@ -49,6 +50,9 @@
       "refreshOnUsage": true,
       "foldEffortVariants": false,
       "preserveCacheEffort": true,
+      "auxIncompatiblePolicy": "current_low",
+      "auxFallbackModel": "",
+      "auxFallbackEffort": "low",
       "cacheTtlSec": 10,
       "refreshCooldownSec": 60,
       "maxAccountDetails": 0,

@@ -1180,4 +1180,48 @@ describe("startPageService & plugin wiring", () => {
     assert.deepEqual(calls3, ["api/upstream-presets", "./", "health", "api/upstream-presets"]);
     assert.equal(h3.elements.get("status").className.includes("ok"), true);
   });
+
+  it("exposes GET /api/aux-routing/diagnostics with CORS headers and rejects non-GET methods", async () => {
+    const { clearAuxRoutingDiagnostics, handleGatewayOnRequest } = await import("../lib/aux-router.mjs");
+    clearAuxRoutingDiagnostics();
+
+    await handleGatewayOnRequest(
+      {
+        model: "claude-opus-5-5",
+        max_tokens: 2048,
+        metadata: { purpose: "project_memory_extract" },
+        output_config: { effort: "high" },
+        messages: [{ role: "user", content: "PRIVATE_PROMPT_NEVER_LOG" }],
+      },
+      {
+        protocol: "anthropic",
+        session: "diag-test-sess-1",
+        path: "/v1/messages",
+        options: { auxIncompatiblePolicy: "current_low" },
+      },
+    );
+
+    const port = await allocateFreePort();
+    const svc = await startPageService({ port });
+    assert.equal(svc.ok, true);
+    try {
+      const res = await fetch(`${svc.url}/api/aux-routing/diagnostics`);
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("access-control-allow-origin"), "*");
+      const data = await res.json();
+      assert.equal(data.ok, true);
+      assert.equal(Array.isArray(data.records), true);
+      assert.equal(data.records.length, 1);
+      assert.equal(data.records[0].detector, "explicit_purpose");
+      assert.equal(data.records[0].policy, "current_low");
+      assert.equal(JSON.stringify(data).includes("PRIVATE_PROMPT_NEVER_LOG"), false);
+      assert.equal(JSON.stringify(data).includes("diag-test-sess-1"), false);
+
+      const postRes = await fetch(`${svc.url}/api/aux-routing/diagnostics`, { method: "POST" });
+      assert.equal(postRes.status, 405);
+    } finally {
+      await svc.close();
+      clearAuxRoutingDiagnostics();
+    }
+  });
 });
