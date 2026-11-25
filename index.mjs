@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { DEFAULT_BASE_URL, normalizeBaseUrl, resolveAuth } from "./lib/auth.mjs";
 import {
   ensureRelaySecret,
+  readLivePluginOptions,
   registerAuthScope,
   setPluginRuntimeContext,
 } from "./lib/aux-router.mjs";
@@ -360,7 +361,7 @@ async function server(input, options) {
                 true,
               ),
             getAuth,
-            getPluginOptions: () => options,
+            getPluginOptions: () => readLivePluginOptions(options),
           }),
         };
       },

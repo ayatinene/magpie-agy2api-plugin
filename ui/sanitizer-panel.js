@@ -2,7 +2,7 @@
   "use strict";
 
   /* ------------------------------------------------------------------ *
-   * Constants (must stay in sync with lib/sanitizer.mjs / middleware.mjs)
+   * Constants (must stay in sync with lib/sanitizer.mjs)
    * ------------------------------------------------------------------ */
   var MAX_RULES = 64;
   var MAX_PATTERN_CHARS = 8192;
@@ -47,8 +47,8 @@
       "seg.on": "开",
       "page.sub": "清洗发送到 Antigravity2API 的请求：剥离 WAF 触发请求头、归一化客户端身份、清理工具描述，并应用自定义改写规则。",
       "sec.sanitizer": "Antigravity2API · 风控提示词清洗",
-      "master.title": "启用清洗中间件",
-      "master.inactive": "清洗中间件已关闭，以下设置当前不会生效。",
+      "master.title": "启用提示词清洗",
+      "master.inactive": "提示词清洗已关闭，以下设置当前不会生效。",
       "identity.title": "客户端身份归一化与去重",
       "identity.desc": "将各类客户端的身份声明统一并去除重复段落。",
       "sideload.title": "系统提示词隐身侧载",

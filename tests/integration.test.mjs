@@ -1,12 +1,15 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { onRequest as hookOnRequest, onResponse as hookOnResponse } from "../hooks.mjs";
-import { onProvider, onRequest as mwOnRequest } from "../middleware.mjs";
+import * as middlewareMod from "../middleware.mjs";
+import { onRequest as mwOnRequest } from "../middleware.mjs";
+import { sanitizeRequestBody } from "../lib/sanitize-request.mjs";
 import { RECOMMENDED_PRESET_RULES, SIDELOAD_OPEN_TAG } from "../lib/sanitizer.mjs";
 import plugin from "../index.mjs";
 import { clearAdminSessionCache } from "../lib/auth.mjs";
@@ -35,13 +38,13 @@ function makeCtx(protocol, providerId = "agy2api", model = "gemini-4-neon") {
   };
 }
 
-describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache_effort", () => {
+describe("Integration: Single-pass PromptSanitizer + preserve_cache_effort in agy2apiFetch", () => {
   beforeEach(() => {
     clearPrefixEffortCache();
     clearModelCache();
   });
 
-  it("sanitizes Claude Code / WAF triggers deterministically and preserves XHigh effort for background project_memory_extract across Gemini protocol", async () => {
+  it("sanitizes Claude Code / WAF triggers deterministically in fetch and preserves XHigh effort for background project_memory_extract across Gemini protocol", async () => {
     const captured = [];
     const mockFetch = async (url, init) => {
       if (String(url).endsWith("/api/models")) {
@@ -71,10 +74,12 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
 
     await ensureModelsDiscovered("http://127.0.0.1:8017", "sk-test", { fetchImpl: mockFetch });
 
+    const sanitizerOptions = { promptRewrite: { sideload_mode: "auto" } };
     const agyFetch = createAgy2ApiFetch({
       baseUrl: "http://127.0.0.1:8017",
       apiKey: "sk-test",
       fetchImpl: mockFetch,
+      getPluginOptions: () => sanitizerOptions,
     });
 
     const systemWithWaf = [
@@ -89,8 +94,6 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
       parts: [{ text: "Help inspect the gateway module and explain its routing." }],
     };
 
-    const sanitizerOptions = { promptRewrite: { sideload_mode: "auto" } };
-
     // 1. Main agent turn with XHigh effort and normal output limit
     const mainRawBody = {
       systemInstruction: { role: "user", parts: [{ text: systemWithWaf }] },
@@ -100,24 +103,19 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
         thinkingConfig: { includeThoughts: true, thinkingLevel: "high" },
       },
     };
-    const mainSanitized = onProvider(mainRawBody, {
-      ...makeCtx("gemini", "agy2api", "gemini-4-neon"),
-      options: sanitizerOptions,
-    });
-    assert.ok(mainSanitized, "middleware should sanitize WAF/identity in main turn");
-    assert.equal("systemInstruction" in mainSanitized, false, "sideload_mode auto should sideload >300B systemInstruction");
-    assert.ok(mainSanitized.contents[0].parts[0].text.startsWith(SIDELOAD_OPEN_TAG));
-    assert.ok(!mainSanitized.contents[0].parts[0].text.includes("x-anthropic-billing-header"));
-    assert.ok(mainSanitized.contents[0].parts[0].text.includes("You are Antigravity"));
 
     const r1 = await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
       method: "POST",
       headers: { "content-type": "application/json", "x-magpie-effort": "xhigh", "x-session-id": "sess-main" },
-      body: JSON.stringify(mainSanitized),
+      body: JSON.stringify(mainRawBody),
     });
     await r1.json();
 
     assert.equal(captured.length, 1);
+    assert.equal("systemInstruction" in captured[0].body, false, "sideload_mode auto should sideload >300B systemInstruction");
+    assert.ok(captured[0].body.contents[0].parts[0].text.startsWith(SIDELOAD_OPEN_TAG));
+    assert.ok(!captured[0].body.contents[0].parts[0].text.includes("x-anthropic-billing-header"));
+    assert.ok(captured[0].body.contents[0].parts[0].text.includes("You are Antigravity"));
     assert.equal(captured[0].body.generationConfig.thinkingConfig.thinkingLevel, "xhigh");
 
     // 2. Background project_memory_extract call: same warm prefix + multi-turn history, lowered to Low + capped maxOutputTokens=4096
@@ -133,23 +131,17 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
         thinkingConfig: { includeThoughts: true, thinkingLevel: "low" },
       },
     };
-    const auxSanitized = onProvider(auxRawBody, {
-      ...makeCtx("gemini", "agy2api", "gemini-4-neon"),
-      options: sanitizerOptions,
-    });
-    assert.ok(auxSanitized);
-    // Verify zero prefix drift after sanitization + sideloading
-    assert.equal(auxSanitized.systemInstruction, mainSanitized.systemInstruction);
-    assert.deepEqual(auxSanitized.contents[0], mainSanitized.contents[0]);
 
     const r2 = await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
       method: "POST",
       headers: { "content-type": "application/json", "x-magpie-effort": "low", "x-session-id": "sess-main" },
-      body: JSON.stringify(auxSanitized),
+      body: JSON.stringify(auxRawBody),
     });
     await r2.json();
 
     assert.equal(captured.length, 2);
+    assert.equal(captured[1].body.systemInstruction, captured[0].body.systemInstruction);
+    assert.deepEqual(captured[1].body.contents[0], captured[0].body.contents[0]);
     assert.equal(
       captured[1].body.generationConfig.thinkingConfig.thinkingLevel,
       "xhigh",
@@ -169,19 +161,15 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
         thinkingConfig: { includeThoughts: true, thinkingLevel: "medium" },
       },
     };
-    const switchSanitized = onProvider(userSwitchMediumBody, {
-      ...makeCtx("gemini", "agy2api", "gemini-4-neon"),
-      options: sanitizerOptions,
-    });
-    assert.deepEqual(switchSanitized.contents[0], mainSanitized.contents[0]);
     const r3 = await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
       method: "POST",
       headers: { "content-type": "application/json", "x-magpie-effort": "medium", "x-session-id": "sess-main" },
-      body: JSON.stringify(switchSanitized),
+      body: JSON.stringify(userSwitchMediumBody),
     });
     await r3.json();
 
     assert.equal(captured.length, 3);
+    assert.deepEqual(captured[2].body.contents[0], captured[0].body.contents[0]);
     assert.equal(
       captured[2].body.generationConfig.thinkingConfig.thinkingLevel,
       "medium",
@@ -192,32 +180,29 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
     const r4 = await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
       method: "POST",
       headers: { "content-type": "application/json", "x-magpie-effort": "low", "x-session-id": "sess-main" },
-      body: JSON.stringify(auxSanitized),
+      body: JSON.stringify(auxRawBody),
     });
     await r4.json();
     assert.equal(captured.length, 4);
     assert.equal(captured[3].body.generationConfig.thinkingConfig.thinkingLevel, "medium");
 
     // 5. Independent session with identical first user turn & system but different session ID stays Low
-    const indSanitized = onProvider(
-      {
-        systemInstruction: { role: "user", parts: [{ text: systemWithWaf }] },
-        contents: [
-          firstUserTurn,
-          { role: "model", parts: [{ text: "Initial." }] },
-          { role: "user", parts: [{ text: "Extract." }] },
-        ],
-        generationConfig: {
-          maxOutputTokens: 4096,
-          thinkingConfig: { includeThoughts: true, thinkingLevel: "low" },
-        },
+    const indRawBody = {
+      systemInstruction: { role: "user", parts: [{ text: systemWithWaf }] },
+      contents: [
+        firstUserTurn,
+        { role: "model", parts: [{ text: "Initial." }] },
+        { role: "user", parts: [{ text: "Extract." }] },
+      ],
+      generationConfig: {
+        maxOutputTokens: 4096,
+        thinkingConfig: { includeThoughts: true, thinkingLevel: "low" },
       },
-      { ...makeCtx("gemini", "agy2api", "gemini-4-neon"), options: sanitizerOptions },
-    );
+    };
     const r5 = await agyFetch("http://127.0.0.1:8017/v1beta/models/gemini-4-neon:streamGenerateContent", {
       method: "POST",
       headers: { "content-type": "application/json", "x-magpie-effort": "low", "x-session-id": "sess-other" },
-      body: JSON.stringify(indSanitized),
+      body: JSON.stringify(indRawBody),
     });
     await r5.json();
 
@@ -236,6 +221,7 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
       baseUrl: "http://127.0.0.1:8017",
       apiKey: "sk-test",
       fetchImpl: mockFetch,
+      getPluginOptions: () => ({ promptRewrite: { sideload_mode: "auto" } }),
     });
 
     const systemBlocks = [
@@ -256,19 +242,16 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
       thinking: { type: "adaptive" },
       output_config: { effort: "high" },
     };
-    const mainSanitized = onProvider(mainBody, {
-      ...makeCtx("anthropic", "agy2api", "claude-opus-5-5"),
-      options: { promptRewrite: { sideload_mode: "auto" } },
-    });
-    assert.equal("system" in mainSanitized, false, "sideload_mode auto should sideload >300B Anthropic system");
-    assert.ok(mainSanitized.messages[0].content[0].text.startsWith(SIDELOAD_OPEN_TAG));
-    assert.equal(mainSanitized.messages[0].content[1].text, "Inspect the plugin architecture.");
 
     await agyFetch("http://127.0.0.1:8017/v1/messages", {
       method: "POST",
       headers: { "content-type": "application/json", "x-magpie-effort": "high", "x-session-id": "anth-sess-1" },
-      body: JSON.stringify(mainSanitized),
+      body: JSON.stringify(mainBody),
     });
+
+    assert.equal("system" in captured[0].body, false, "sideload_mode auto should sideload >300B Anthropic system");
+    assert.ok(captured[0].body.messages[0].content[0].text.startsWith(SIDELOAD_OPEN_TAG));
+    assert.equal(captured[0].body.messages[0].content[1].text, "Inspect the plugin architecture.");
 
     const auxBody = {
       model: "claude-opus-5-5",
@@ -282,18 +265,14 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
       thinking: { type: "adaptive" },
       output_config: { effort: "low", format: { type: "json_schema", schema: { type: "object" } } },
     };
-    const auxSanitized = onProvider(auxBody, {
-      ...makeCtx("anthropic", "agy2api", "claude-opus-5-5"),
-      options: { promptRewrite: { sideload_mode: "auto" } },
-    });
-    assert.equal(auxSanitized.system, mainSanitized.system);
-    assert.deepEqual(auxSanitized.messages[0], mainSanitized.messages[0]);
     await agyFetch("http://127.0.0.1:8017/v1/messages", {
       method: "POST",
       headers: { "content-type": "application/json", "x-magpie-effort": "low", "x-session-id": "anth-sess-1" },
-      body: JSON.stringify(auxSanitized),
+      body: JSON.stringify(auxBody),
     });
 
+    assert.equal(captured[1].body.system, captured[0].body.system);
+    assert.deepEqual(captured[1].body.messages[0], captured[0].body.messages[0]);
     assert.equal(captured[0].body.output_config.effort, "high");
     assert.equal(captured[1].body.output_config.effort, "high");
     assert.deepEqual(captured[1].body.output_config.format, {
@@ -522,7 +501,7 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
       ],
     };
 
-    const sanitized = onProvider(body, makeCtx("chat", "agy2api", "gemini-4-neon"));
+    const sanitized = sanitizeRequestBody("chat", body, {});
     assert.ok(sanitized);
     assert.ok(sanitized.messages[0].content.includes("You are Antigravity"));
     assert.equal(
@@ -583,73 +562,130 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
     }
   });
 
-  it("middleware.mjs delegates plugin account requests to single-pass fetch.mjs sanitization while supporting agy2api-plugin and non-plugin custom providers", async () => {
+  it("removes middleware.onProvider and runs single-pass fetch.mjs sanitization with live plugins.json hot-reload", async () => {
+    assert.equal("onProvider" in middlewareMod, false, "middleware.mjs must not export onProvider");
+    assert.equal("DEFAULT_TARGET_PROVIDER_IDS" in middlewareMod, false);
+    assert.equal(typeof middlewareMod.onRequest, "function");
+
     const rawBody = {
       model: "claude-opus-5-5",
       max_tokens: 4096,
       system: [
         { type: "text", text: "x-anthropic-billing-header: cc_version=2.1;" },
-        { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+        { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude.\nFollow keyword_alpha." },
       ],
       messages: [{ role: "user", content: "hello" }],
     };
 
-    // 1. account === "plugin" skips onProvider (both agy2api and agy2api-plugin), unless forceMiddlewareOnPlugin: true
-    assert.equal(
-      onProvider(rawBody, {
-        protocol: "anthropic",
-        provider: { id: "agy2api", account: "plugin" },
-      }),
-      undefined,
-    );
-    assert.equal(
-      onProvider(rawBody, {
-        protocol: "anthropic",
-        provider: { id: "agy2api-plugin", account: "plugin" },
-      }),
-      undefined,
-    );
-    const forced = onProvider(rawBody, {
-      protocol: "anthropic",
-      provider: { id: "agy2api-plugin", account: "plugin" },
-      options: { forceMiddlewareOnPlugin: true },
-    });
-    assert.ok(forced);
-
-    // 2. Non-plugin account (direct custom provider or tests) still runs onProvider for both agy2api and agy2api-plugin
-    const customOut = onProvider(rawBody, {
-      protocol: "anthropic",
-      provider: { id: "agy2api-plugin" },
-    });
-    assert.ok(customOut);
-    assert.equal(JSON.stringify(customOut).includes("You are Antigravity"), true);
-
-    // 3. End-to-end single pass: middleware skips account:"plugin", fetch.mjs performs the sole sanitization pass
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy2api-live-san-"));
+    const pluginsJsonPath = path.join(tmpDir, "plugins.json");
+    const origFetch = globalThis.fetch;
     const sentBodies = [];
-    const agyFetch = createAgy2ApiFetch({
-      baseUrl: "http://127.0.0.1:8017",
-      apiKey: "sk-test",
-      fetchImpl: async (_url, init) => {
-        sentBodies.push(JSON.parse(init.body));
-        return new Response(JSON.stringify({ ok: true }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      },
-    });
-    const mwResult = onProvider(rawBody, {
-      protocol: "anthropic",
-      provider: { id: "agy2api", account: "plugin" },
-    });
-    assert.equal(mwResult, undefined);
-    await agyFetch("http://127.0.0.1:8017/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(mwResult ?? rawBody),
-    });
-    assert.equal(sentBodies.length, 1);
-    assert.equal(JSON.stringify(sentBodies[0]).includes("x-anthropic-billing-header"), false);
-    assert.equal(JSON.stringify(sentBodies[0]).includes("You are Antigravity"), true);
+    globalThis.fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    try {
+      fs.writeFileSync(
+        pluginsJsonPath,
+        JSON.stringify({
+          plugins: [
+            {
+              spec: "github:ayatinene/magpie-agy2api-plugin",
+              options: { promptSanitizer: true },
+            },
+          ],
+        }),
+      );
+
+      const srv = await plugin.server(
+        { directory: tmpDir, magpie: {} },
+        { disablePageService: true, promptSanitizer: true },
+      );
+      const cfg = { provider: {} };
+      await srv.config(cfg);
+      const loaded = await srv.auth.loader(
+        async () => ({ type: "api", key: "sk-test", metadata: { baseUrl: "http://127.0.0.1:8017" } }),
+        cfg.provider.agy2api,
+      );
+
+      // 1. Default enabled -> single-pass sanitized in fetch
+      await loaded.fetch("http://127.0.0.1:8017/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(rawBody),
+      });
+      assert.equal(sentBodies.length, 1);
+      assert.equal(JSON.stringify(sentBodies[0]).includes("x-anthropic-billing-header"), false);
+      assert.equal(JSON.stringify(sentBodies[0]).includes("You are Antigravity"), true);
+
+      // 2. Hot-reload plugins.json (past 1s stat cache window) to disable sanitizer without restarting server()
+      await new Promise((r) => setTimeout(r, 1050));
+      fs.writeFileSync(
+        pluginsJsonPath,
+        JSON.stringify({
+          plugins: [
+            {
+              spec: "github:ayatinene/magpie-agy2api-plugin",
+              options: { promptSanitizer: false },
+            },
+          ],
+        }),
+      );
+
+      await loaded.fetch("http://127.0.0.1:8017/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(rawBody),
+      });
+      assert.equal(sentBodies.length, 2);
+      assert.equal(JSON.stringify(sentBodies[1]).includes("You are Claude Code"), true);
+
+      // 3. Hot-reload custom rewrite rule in plugins.json -> immediately applied on next request
+      await new Promise((r) => setTimeout(r, 1050));
+      fs.writeFileSync(
+        pluginsJsonPath,
+        JSON.stringify({
+          plugins: [
+            {
+              spec: "github:ayatinene/magpie-agy2api-plugin",
+              options: {
+                promptSanitizer: true,
+                promptRewrite: {
+                  enabled: true,
+                  normalize_identity: true,
+                  sideload_mode: "off",
+                  rules: [
+                    {
+                      id: "r1",
+                      pattern: "*keyword_alpha*",
+                      replacement: "Follow keyword_beta.",
+                      scope: "prompt",
+                      enabled: true,
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+        }),
+      );
+
+      await loaded.fetch("http://127.0.0.1:8017/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(rawBody),
+      });
+      assert.equal(sentBodies.length, 3);
+      assert.equal(JSON.stringify(sentBodies[2]).includes("keyword_beta"), true);
+    } finally {
+      globalThis.fetch = origFetch;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
   it("wires hooks.mjs in package.json and completes hooks.onRequest -> middleware.onRequest -> agy2apiFetch -> hooks.onResponse end-to-end", async () => {

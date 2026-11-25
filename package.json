@@ -1,9 +1,9 @@
 {
   "name": "magpie-agy2api-plugin",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "license": "CC-BY-NC-SA-4.0",
-  "description": "Magpie provider plugin and middleware for Antigravity2API",
+  "description": "Magpie provider plugin for Antigravity2API with built-in prompt sanitization and cache-aware auxiliary routing",
   "keywords": [
     "opencode",
     "opencode-plugin",
@@ -35,8 +35,8 @@
       }
     },
     "summary": {
-      "en": "Antigravity2API provider plugin with cookie-authenticated admin discovery, shared/family pool quota deduplication, fault isolation, multi-protocol effort preservation, and prompt sanitization middleware with visual rule editor.",
-      "zh": "Antigravity2API 专用插件：管理员会话认证、全动态模型发现、共享/家庭组配额去重、故障隔离规范化、全协议思考档位缓存对齐与可视化提示词清洗中间件。"
+      "en": "Antigravity2API provider plugin with cookie-authenticated admin discovery, shared/family pool quota deduplication, fault isolation, cache-aware auxiliary routing, and single-pass prompt sanitization with visual rule editor.",
+      "zh": "Antigravity2API 专用插件：管理员会话认证、全动态模型发现、共享/家庭组配额去重、故障隔离规范化、缓存感知辅助路由与单遍无时限提示词清洗及可视化规则编辑。"
     },
     "options": {
       "promptSanitizer": true,

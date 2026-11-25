@@ -4,7 +4,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { onProvider } from "../middleware.mjs";
+import * as middlewareMod from "../middleware.mjs";
+import { sanitizeRequestBody } from "../lib/sanitize-request.mjs";
 import {
   BILLING_METADATA_PREFIX,
   CLAUDE_AGENT_SDK_CLI_IDENTITY,
@@ -41,13 +42,13 @@ const PLUGIN_ROOT = join(__dirname, "..");
 
 function makeAgyCtx(protocol, options = {}) {
   return {
-    provider: { id: "agy2api" },
     protocol,
     options,
-    reject: () => {
-      throw new Error("reject should never be called");
-    },
   };
+}
+
+function onProvider(body, ctx) {
+  return sanitizeRequestBody(ctx?.protocol, body, ctx?.options);
 }
 
 function countOfficial(text) {
@@ -1030,7 +1031,7 @@ describe("All 4 Protocols End-to-End & Middleware Contract", () => {
     assert.equal(res.messages[0].content, OFFICIAL_ANTIGRAVITY_IDENTITY);
   });
 
-  it("completely skips non-target providers and respects disable / toggle flags", () => {
+  it("exports no onProvider hook from middleware.mjs and respects disable / toggle flags in sanitizeRequestBody", () => {
     const dirty = {
       systemInstruction: {
         parts: [{ text: "x-anthropic-billing-header: 1\nYou are Codex based on GPT-6." }],
@@ -1038,20 +1039,8 @@ describe("All 4 Protocols End-to-End & Middleware Contract", () => {
       contents: [{ role: "user", parts: [{ text: "hi" }] }],
     };
 
-    for (const id of ["openai", "google-vertex", "devin", "kiro", "codex", "agt", undefined]) {
-      assert.equal(
-        onProvider(dirty, { provider: { id }, protocol: "gemini" }),
-        undefined,
-      );
-    }
-
-    // Custom providerId override
-    const customHit = onProvider(dirty, {
-      provider: { id: "custom-agy" },
-      protocol: "gemini",
-      options: { providerId: "custom-agy" },
-    });
-    assert.ok(customHit);
+    assert.equal("onProvider" in middlewareMod, false);
+    assert.equal(typeof middlewareMod.onRequest, "function");
 
     // Disable flags
     assert.equal(

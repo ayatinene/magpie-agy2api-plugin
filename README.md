@@ -1,10 +1,10 @@
 # magpie-agy2api-plugin
 
-Antigravity2API (v0.1.12+) 的 Magpie 专用 Provider 插件与提示词清洗中间件包。
+Antigravity2API (v0.1.12+) 的 Magpie 专用 Provider 插件，内置单遍无时限提示词清洗、缓存感知辅助请求路由与侧边栏可视化规则配置页。
 
 ## 核心特性
 
-- **提示词清洗中间件与专属侧边栏页面 (`onProvider` + `fetch` + `magpie.page`)**：提示词清洗使用同一份选项。当请求通过本插件自身的 Provider 账号（`ctx.provider.account === "plugin"`，兼容 `"agy2api"` 与 `"agy2api-plugin"`）发送时，`middleware.mjs`（`onProvider`）会跳过二次预洗，直接由 `lib/fetch.mjs` 在最终线协议上**唯一执行一次**无 250ms 时限的 `sanitizeRequestBody`，既确保大请求不被漏洗，也消除双遍清洗带来的非幂等漂移；直连自定义 Provider 时 `onProvider` 仍照常执行清洗。在 Magpie 侧边栏 **插件 → 风控提示词清洗**（`Prompt Sanitizer`）可打开独立整页，提供总开关（`promptSanitizer`）、客户端身份归一化与去重（`normalize_identity`）、系统提示词隐身侧载（`sideload_mode`：`off` / `auto` / `always`，默认 `off` 以契合 `Antigravity2API` `SYSTEM_PROMPT=full` 的 `<USER_REQUEST>` 封装，支持三段式分段控件按需切换）、工具描述清洗（`sanitize_tools_description`）、自定义 / 12 条推荐预设改写规则的增删改排序与一键恢复预设；同时在同一页面内集成 **「辅助请求路由」（`Auxiliary request routing`）** 可视化配置区，支持切换前缀不兼容辅助策略（保持原样 / 当前 Low / 回退模型）、从 `GET api/aux-routing/state` 实时拉取动态发现的可用文本模型列表并根据所选模型自动联动过滤支持的思考档位、展开配置 3 项高级阈值参数（`aux_min_body_bytes` / `aux_max_output_tokens` / `aux_session_ttl_sec`）及一键恢复默认，当总开关 `preserve_cache_effort` 关闭时页面实时展示联动停用状态提示；页面底部固定保存 / 还原栏，保存后热更新生效；读取设置失败时禁止保存并给出提示与「重试」按钮；同时兼容通过 Plugins → Options JSON 编辑。
+- **单遍无时限提示词清洗与专属侧边栏页面 (`fetch` + `magpie.page`)**：提示词清洗由插件自身 Provider `fetch`（`lib/fetch.mjs`，Bun 运行时）在最终线协议上**唯一执行一次**无 250ms 时限的 `sanitizeRequestBody`，既确保大请求不被漏洗，也消除双遍清洗带来的非幂等漂移；同时通过 `readLivePluginOptions`（1 秒 `stat` 缓存读取 `<directory>/plugins.json`）支持侧边栏保存后热更新生效，无需重启容器或重载插件宿主。在 Magpie 侧边栏 **插件 → 风控提示词清洗**（`Prompt Sanitizer`）可打开独立整页，提供「启用提示词清洗」总开关（`promptSanitizer`）、客户端身份归一化与去重（`normalize_identity`）、系统提示词隐身侧载（`sideload_mode`：`off` / `auto` / `always`，默认 `off` 以契合 `Antigravity2API` `SYSTEM_PROMPT=full` 的 `<USER_REQUEST>` 封装，支持三段式分段控件按需切换）、工具描述清洗（`sanitize_tools_description`）、自定义 / 12 条推荐预设改写规则的增删改排序与一键恢复预设；同时在同一页面内集成 **「辅助请求路由」（`Auxiliary request routing`）** 可视化配置区，支持切换前缀不兼容辅助策略（保持原样 / 当前 Low / 回退模型）、从 `GET api/aux-routing/state` 实时拉取动态发现的可用文本模型列表并根据所选模型自动联动过滤支持的思考档位、展开配置 3 项高级阈值参数（`aux_min_body_bytes` / `aux_max_output_tokens` / `aux_session_ttl_sec`）及一键恢复默认，当总开关 `preserve_cache_effort` 关闭时页面实时展示联动停用状态提示；页面底部固定保存 / 还原栏，保存后热更新生效；读取设置失败时禁止保存并给出提示与「重试」按钮；同时兼容通过 Plugins → Options JSON 编辑。
   - **「拉取 Antigravity Tools 最新规则」（`Fetch latest Antigravity Tools rules`，在线）**：页面经 `magpie.page.service`（本机 `127.0.0.1:18417`，端口可由 `pageServicePort` 选项调整，修改端口后旧端口自动关闭，`disablePageService: true` 可停掉已在运行的服务）托管后，点击并经二次确认，通过 `GET api/upstream-presets` 拉取 Antigravity-Manager 仓库 `beta` 分支最新推荐规则（服务端缓存 60 秒；若遇到页面服务尚未唤醒的非 JSON 代理 `502` 或网络异常，自动唤醒 `./` 并轮询 `health` 就绪后重试），将 4 个开关复位为默认开启、`sideload_mode` 复位为 `off`；上游规则采用严格解析，只要存在任一无法识别的条目、总数超过 64 条、`id` 重复或字段超长，即整体报错且不改动当前草稿；拉取期间若草稿已被修改则不覆盖并给出提示，拉到的规则与已保存设置一致时提示无需保存；结果载入草稿后需点击「保存并生效」才会应用，也可点击「还原」撤销。未经服务代理（静态页面）访问时该按钮禁用。
   - **「恢复本地预设」（离线）**：无需联网，点击并经二次确认后，将 4 个开关全部开启、`sideload_mode` 复位为 `off` 并恢复内置 12 条推荐规则，可作为在线拉取失败时的兜底。
   - 静态页面加载后会自动无缝跳转到服务托管页：`magpie web` 下走 `magpie.service` 代理路径，macOS / Windows / Linux 桌面端窗口（`wails://localhost` / `http://wails.localhost`）读取 `pageServicePort` 后直连本机 `http://127.0.0.1:<port>/` 并输出显式回环源 CSP 以兼容 WebKit 沙盒（`ui/service-bridge.js` 提供与 Magpie `pagebridge.js` 一致的 `postMessage` 桥，端口未监听时自动回退展示静态设置页）。
@@ -67,7 +67,7 @@ magpie plugin add /path/to/magpie-agy2api-plugin
 | `refresh_cooldown_sec` (`refreshCooldownSec`) | `60` | 触发 `/api/accounts/refresh` 的最小冷却秒数 |
 | `max_account_details` (`maxAccountDetails`) | `0` | 最多展示的账号明细条数，`0` 表示不限制 |
 | `pageServicePort` | `18417` | 侧边栏设置页本机服务监听端口（`127.0.0.1`，修改后旧端口自动关闭；设为 `disablePageService: true` 可停用本机页面服务） |
-| `promptSanitizer` | `true` | 是否启用提示词清洗（同时作用于 Gateway `onProvider` 中间件与 Provider `fetch`，支持侧边栏「风控提示词清洗」页面切换） |
+| `promptSanitizer` | `true` | 是否启用提示词清洗（作用于 Provider `fetch` 出站请求，支持侧边栏「风控提示词清洗」页面切换并热更新生效） |
 | `promptRewrite.enabled` | `true` | 是否启用自定义 / 预设改写规则列表 |
 | `promptRewrite.normalize_identity` | `true` | 是否归一化第三方客户端身份声明并去重官方身份 |
 | `promptRewrite.sideload_mode` | `"off"` | 系统提示词隐身侧载模式：`"off"`（默认，保留原生 `systemInstruction` 权限，契合 `Antigravity2API` `SYSTEM_PROMPT=full`）/ `"auto"`（超过 300 字节或含指令关键词时自动侧载至首轮用户消息 `<system-instruction>`）/ `"always"`（始终侧载） |
@@ -81,13 +81,6 @@ node --test --test-concurrency=1 tests/*.test.mjs
 ```
 
 - `tests/agt-parity.test.mjs` 逐条移植了 Antigravity-Manager 仓库 `beta` 分支 `prompt_sanitizer.rs` 中的 89 个 `#[test]` 用例，用于校验提示词清洗结果与 Antigravity Tools 原版一致。
-- `tools/moejs-bench/`：在 Magpie 实际使用的 `moejs` 引擎中运行 `middleware.mjs`，验证每个用例在 250ms 预算内完成且输出与 Node 一致（需 Go 1.26+）：
-
-```bash
-cd tools/moejs-bench
-node gen-corpus.mjs /tmp/corpus.ndjson
-go run . ../.. /tmp/corpus.ndjson        # 可选第三个参数：预算毫秒数，默认 250
-```
 
 ## License
 
