@@ -7,6 +7,8 @@
   var MAX_RULES = 64;
   var MAX_PATTERN_CHARS = 8192;
   var MAX_REPLACEMENT_CHARS = 16384;
+  var DEFAULT_PAGE_SERVICE_PORT = 18417;
+  var DESKTOP_HANDOFF_FALLBACK_MS = 800;
   var SCOPES = ["all", "prompt", "tools"];
   var SIDELOAD_MODES = ["off", "auto", "always"];
   var AUX_POLICIES = ["keep", "current_low", "fallback_model"];
@@ -1797,6 +1799,24 @@
     });
   }
 
+  function isDesktopAppLocation(loc) {
+    if (!loc) return false;
+    var proto = String(loc.protocol || "").toLowerCase();
+    var host = String(loc.hostname || "").toLowerCase();
+    if (proto === "wails:") return true;
+    if (host === "wails.localhost" || /\.wails\.localhost$/.test(host)) return true;
+    return false;
+  }
+
+  function resolveLocalServicePort(opts) {
+    if (isObj(opts) && coerceBool(pick(opts, "disablePageService", "disable_page_service"), false) === true) {
+      return 0;
+    }
+    var raw = isObj(opts) ? pick(opts, "pageServicePort", "page_service_port") : undefined;
+    var n = typeof raw === "number" ? raw : (typeof raw === "string" && raw.trim() ? Number(raw) : NaN);
+    return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : DEFAULT_PAGE_SERVICE_PORT;
+  }
+
   function init() {
     bind();
     var magpie = window.magpie;
@@ -1817,7 +1837,9 @@
       lang = langFrom(info && info.lang);
       return info;
     }, function () { /* keep default language */ return null; }).then(function (info) {
-      // Seamless handoff: static page -> magpie.service (app stays hidden: no flash).
+      // Seamless handoff: `magpie web` injects `magpie.service`; desktop windows (`wails://localhost`
+      // on macOS/Linux, `http://wails.localhost` on Windows) leave `magpie.service` empty so the
+      // frame connects directly to `http://127.0.0.1:<port>/` after reading `pageServicePort`.
       var svcUrl = typeof magpie.service === "string" && magpie.service ? magpie.service
         : (info && typeof info.service === "string" ? info.service : "");
       if (!window.__magpieServiceHosted && svcUrl) {
@@ -1845,6 +1867,18 @@
         saved = normalize(baseOptions);
         draft = cloneState(saved);
         renderAll();
+        if (!window.__magpieServiceHosted && !loadError && isDesktopAppLocation(window.location)) {
+          var localPort = resolveLocalServicePort(baseOptions);
+          if (localPort > 0) {
+            // If loopback navigation is refused, WebKit stays on the current static document
+            // without firing an error: reveal the already-rendered static UI after a short grace period.
+            setTimeout(function () {
+              if (els.app && els.app.hidden) showApp();
+            }, DESKTOP_HANDOFF_FALLBACK_MS);
+            window.location.replace("http://127.0.0.1:" + localPort + "/");
+            return;
+          }
+        }
         showApp();
         loadAuxState("init");
       });

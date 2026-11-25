@@ -14,6 +14,7 @@ import {
   MAX_RULES,
   MAX_UPSTREAM_BODY_BYTES,
   UPSTREAM_AGT_BETA_CONFIG_URL,
+  buildHtmlCsp,
   fetchUpstreamPresetRules,
   parseRustPresetRules,
   startPageService,
@@ -657,14 +658,14 @@ describe("startPageService & plugin wiring", () => {
     assert.deepEqual(await healthRes.json(), { ok: true, port });
 
     // 2. GET / (and /index.html, /sanitizer-panel.html)
+    const expectedCsp = `default-src 'none'; script-src 'self' ${base}; style-src 'self' ${base} 'unsafe-inline'; connect-src 'self' ${base}; img-src 'self' ${base} data:; font-src 'self' ${base}`;
+    assert.equal(buildHtmlCsp(port), expectedCsp);
+    assert.equal(expectedCsp.includes("frame-ancestors"), false);
     for (const htmlPath of ["/", "/index.html", "/sanitizer-panel.html"]) {
       const htmlRes = await fetch(`${base}${htmlPath}`);
       assert.equal(htmlRes.status, 200);
       assert.match(htmlRes.headers.get("content-type") || "", /^text\/html/);
-      assert.equal(
-        htmlRes.headers.get("content-security-policy"),
-        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self'; frame-ancestors 'self'",
-      );
+      assert.equal(htmlRes.headers.get("content-security-policy"), expectedCsp);
       const htmlText = await htmlRes.text();
       assert.ok(htmlText.includes('<script src="service-bridge.js"></script>'));
       assert.ok(!htmlText.includes("_magpie/bridge.js"));
@@ -865,8 +866,7 @@ describe("startPageService & plugin wiring", () => {
     cleanups.push(() => stopPageService());
     await plugin.server({}, { pageServicePort: port });
     const registry = globalThis[Symbol.for("magpie.agy2api.pageServices")];
-    // Wait briefly for fire-and-forget startup inside server()
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    // First listen attempt is awaited so desktop `pageHost` gets a live port immediately
     assert.equal(registry.get(port)?.server?.listening, true);
 
     const hooks = await plugin.server({}, { disablePageService: true });
@@ -1844,11 +1844,21 @@ describe("startPageService & plugin wiring", () => {
     return { ok: true, preserveCacheEffort: true, preserveSource: "default", catalogStatus: "ok", catalogError: "", models: AUX_MODELS, ...over };
   }
 
-  async function mountAuxPanel({ options = {}, state = auxStatePayload(), fetchImpl = null, hosted = true } = {}) {
+  async function mountAuxPanel({ options = {}, state = auxStatePayload(), fetchImpl = null, hosted = true, location = null, service = "" } = {}) {
     const html = fs.readFileSync(path.join(PLUGIN_ROOT, "ui/sanitizer-panel.html"), "utf8");
     const jsSource = fs.readFileSync(path.join(PLUGIN_ROOT, "ui/sanitizer-panel.js"), "utf8");
     const { win, doc } = createMiniDom(html);
-    const ctl = { state, calls: [], setCalls: [], visCbs: [] };
+    const ctl = { state, calls: [], setCalls: [], visCbs: [], replacedUrls: [] };
+    win.location = {
+      protocol: "http:",
+      hostname: "127.0.0.1",
+      search: "",
+      href: "http://127.0.0.1:18417/",
+      ...(location || {}),
+      replace(url) {
+        ctl.replacedUrls.push(String(url));
+      },
+    };
     const fetchFn = async (url, init) => {
       const u = String(url);
       ctl.calls.push(u);
@@ -1864,7 +1874,8 @@ describe("startPageService & plugin wiring", () => {
     win.fetch = fetchFn;
     if (hosted) win.__magpieServiceHosted = true;
     win.magpie = {
-      ready: Promise.resolve({ lang: "en" }),
+      service,
+      ready: Promise.resolve({ lang: "en", service }),
       options: {
         get: async () => JSON.parse(JSON.stringify(options)),
         set: async (payload) => {
@@ -2234,16 +2245,112 @@ describe("startPageService & plugin wiring", () => {
   });
 
   it("aux panel: unhosted pages never call the state API and disable catalog refresh", async () => {
-    const p = await mountAuxPanel({ options: { auxFallbackModel: "saved-model", auxIncompatiblePolicy: "fallback_model" }, hosted: false });
+    const p = await mountAuxPanel({
+      options: { auxFallbackModel: "saved-model", auxIncompatiblePolicy: "fallback_model" },
+      hosted: false,
+      location: { protocol: "https:", hostname: "magpie.example.com", href: "https://magpie.example.com/_magpie/plugin/tok/sanitizer-panel.html" },
+    });
     try {
-      // magpie.service is absent here, so the page stays put and uses the bridge only
+      // magpie.service is absent on a remote browser, so the page stays put and never redirects to 127.0.0.1
+      assert.deepEqual(p.ctl.replacedUrls, []);
       assert.deepEqual(p.ctl.calls, []);
+      assert.equal(p.$("app").hidden, false);
       assert.equal(p.$("btn-aux-refresh").disabled, true);
       assert.equal(p.$("btn-aux-refresh").title, "Requires Magpie page service to fetch upstream");
       assert.equal(p.$("sel-aux-model").value, "saved-model");
       assert.equal(p.optionTexts(p.$("sel-aux-model"))[1], "saved-model");
     } finally {
       p.close();
+    }
+  });
+
+  it("desktop window handoff: redirects wails://localhost and http://wails.localhost to local pageServicePort, honors disablePageService, and reveals fallback UI if WebKit refuses navigation", async () => {
+    // 1. macOS / Linux desktop (`wails://localhost`) -> default 18417, keeps #app hidden during handoff, then reveals if refused
+    const macDefault = await mountAuxPanel({
+      options: {},
+      hosted: false,
+      location: {
+        protocol: "wails:",
+        hostname: "localhost",
+        href: "wails://localhost/_magpie/plugin/tok/sanitizer-panel.html",
+      },
+    });
+    try {
+      assert.deepEqual(macDefault.ctl.replacedUrls, ["http://127.0.0.1:18417/"]);
+      assert.equal(macDefault.$("app").hidden, true);
+      // Simulate WebKit leaving the frame on the static document when loopback is refused
+      await macDefault.settle(850);
+      assert.equal(macDefault.$("app").hidden, false);
+    } finally {
+      macDefault.close();
+    }
+
+    // 2. macOS desktop with custom `pageServicePort`
+    const macCustomPort = await mountAuxPanel({
+      options: { pageServicePort: "19417" },
+      hosted: false,
+      location: {
+        protocol: "wails:",
+        hostname: "localhost",
+        href: "wails://localhost/_magpie/plugin/tok/sanitizer-panel.html",
+      },
+    });
+    try {
+      assert.deepEqual(macCustomPort.ctl.replacedUrls, ["http://127.0.0.1:19417/"]);
+    } finally {
+      macCustomPort.close();
+    }
+
+    // 3. Windows desktop (`http://wails.localhost`) -> redirects to loopback service
+    const winDesktop = await mountAuxPanel({
+      options: {},
+      hosted: false,
+      location: {
+        protocol: "http:",
+        hostname: "wails.localhost",
+        href: "http://wails.localhost/_magpie/plugin/tok/sanitizer-panel.html?_o=http%3A%2F%2Fwails.localhost",
+      },
+    });
+    try {
+      assert.deepEqual(winDesktop.ctl.replacedUrls, ["http://127.0.0.1:18417/"]);
+    } finally {
+      winDesktop.close();
+    }
+
+    // 4. Desktop with `disablePageService: true` -> stays on static page and reveals #app immediately
+    const desktopDisabled = await mountAuxPanel({
+      options: { disablePageService: true },
+      hosted: false,
+      location: {
+        protocol: "wails:",
+        hostname: "localhost",
+        href: "wails://localhost/_magpie/plugin/tok/sanitizer-panel.html",
+      },
+    });
+    try {
+      assert.deepEqual(desktopDisabled.ctl.replacedUrls, []);
+      assert.equal(desktopDisabled.$("app").hidden, false);
+    } finally {
+      desktopDisabled.close();
+    }
+
+    // 5. `magpie web` with `magpie.service` -> redirects immediately to the proxy path
+    const webProxied = await mountAuxPanel({
+      options: {},
+      hosted: false,
+      service: "https://magpie.example.com/_magpie/plugin/tok/_magpie/service/",
+      location: {
+        protocol: "https:",
+        hostname: "magpie.example.com",
+        href: "https://magpie.example.com/_magpie/plugin/tok/sanitizer-panel.html",
+      },
+    });
+    try {
+      assert.deepEqual(webProxied.ctl.replacedUrls, [
+        "https://magpie.example.com/_magpie/plugin/tok/_magpie/service/",
+      ]);
+    } finally {
+      webProxied.close();
     }
   });
 });
