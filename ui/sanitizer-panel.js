@@ -9,6 +9,19 @@
   var MAX_REPLACEMENT_CHARS = 16384;
   var SCOPES = ["all", "prompt", "tools"];
   var SIDELOAD_MODES = ["off", "auto", "always"];
+  var AUX_POLICIES = ["keep", "current_low", "fallback_model"];
+  var AUX_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+  // numeric aux_* thresholds: defaults mirror package.json magpie.options / lib/aux-router.mjs
+  var AUX_NUM = [
+    { key: "minBodyBytes", snake: "aux_min_body_bytes", camel: "auxMinBodyBytes", def: "32768", max: "6291456", input: "in-aux-min" },
+    { key: "maxOutputTokens", snake: "aux_max_output_tokens", camel: "auxMaxOutputTokens", def: "8192", max: "1048576", input: "in-aux-out" },
+    { key: "sessionTtlSec", snake: "aux_session_ttl_sec", camel: "auxSessionTtlSec", def: "600", max: "86400", input: "in-aux-ttl" }
+  ];
+  var AUX_KEYS = [
+    "aux_incompatible_policy", "auxIncompatiblePolicy", "aux_fallback_model", "auxFallbackModel",
+    "aux_fallback_effort", "auxFallbackEffort", "aux_min_body_bytes", "auxMinBodyBytes",
+    "aux_max_output_tokens", "auxMaxOutputTokens", "aux_session_ttl_sec", "auxSessionTtlSec"
+  ];
 
   var PRESETS = [
     { id: "preset-opencode", pattern: "You are an AI agent running in OpenCode*", replacement: "", scope: "prompt", enabled: true },
@@ -95,7 +108,60 @@
       "sync.same": "已是 Antigravity Tools 最新规则（{n} 条），与已保存的设置一致，无需保存",
       "sync.stale": "拉取期间设置有改动，已保留你的修改，未应用拉取结果",
       "sync.fail": "拉取 Antigravity Tools 规则失败：{err}（可点击「恢复本地预设」）",
-      "sync.unknownErr": "未知错误"
+      "sync.unknownErr": "未知错误",
+      "sec.aux": "辅助请求路由",
+      "aux.defaults": "恢复默认",
+      "aux.defaultsConfirm": "确认恢复默认？",
+      "aux.defaultsTip": "仅将「辅助请求路由」恢复为默认值，不影响清洗设置与改写规则",
+      "aux.off.title": "缓存亲和总开关已关闭，辅助请求路由当前不生效",
+      "aux.off.provider": "来自 Provider 弹窗中的「preserve_cache_effort」开关，请在 Provider 设置中重新开启。",
+      "aux.off.plugin": "来自插件选项（plugins.json）中的 preserve_cache_effort，请在 Plugins → Options 中修改。",
+      "aux.off.static": "来自插件内置的静态默认配置，当前未被 Provider 托管。",
+      "aux.policy.title": "不兼容辅助请求策略",
+      "aux.policy.desc": "前缀与主会话缓存不兼容的辅助请求（如记忆提取、标题生成）的处理方式。",
+      "aux.policy.keep": "保持原样",
+      "aux.policy.current_low": "当前 Low",
+      "aux.policy.fallback_model": "回退模型",
+      "aux.model.title": "回退模型",
+      "aux.model.desc": "策略为「回退模型」时，将辅助请求切换到的低成本模型，候选来自当前动态模型目录。",
+      "aux.model.choose": "选择模型…",
+      "aux.model.notFound": "{id}（当前目录未发现）",
+      "aux.model.unset": "尚未选择回退模型，运行时将按「当前 Low」处理。",
+      "aux.model.missing": "已保存的模型不在当前目录中，运行时将按「当前 Low」处理。",
+      "aux.model.empty": "当前模型目录为空，暂无可选模型。",
+      "aux.model.loadFailed": "模型目录读取失败：{err}",
+      "aux.model.ambiguous": "检测到多个登录作用域，无法确定模型目录，运行时将按「当前 Low」处理。",
+      "aux.model.refresh": "刷新模型目录",
+      "aux.refreshFailed": "刷新模型目录失败：{err}",
+      "aux.effort.title": "回退思考档位",
+      "aux.effort.desc": "回退模型使用的思考档位，仅列出所选模型支持的档位。",
+      "aux.effort.fixed": "档位由模型别名固定：{effort}",
+      "aux.effort.none": "无思考参数 · 自动剥离",
+      "aux.effort.default": "默认",
+      "aux.effort.switched": "所选模型不支持 {from}，已切换为 {to}",
+      "aux.effort.adapt": "已保存的档位 {from} 不被所选模型支持，运行时将自动适配为 {to}",
+      "aux.effort.auto": "未选定模型或模型不在当前目录中，运行时将按目标模型自动适配档位。",
+      "effort.minimal": "Minimal",
+      "effort.low": "Low",
+      "effort.medium": "Medium",
+      "effort.high": "High",
+      "effort.xhigh": "XHigh",
+      "effort.max": "Max",
+      "aux.adv.title": "高级参数",
+      "aux.adv.default": "默认",
+      "aux.adv.changed": "已修改 {n} 项",
+      "aux.minBody.title": "最小请求体",
+      "aux.minBody.desc": "结构启发式判定辅助请求的最小请求体字节数，低于该体积不触发。",
+      "aux.maxOut.title": "最大输出 Token",
+      "aux.maxOut.desc": "结构启发式判定辅助请求的最大输出 Token 上限。",
+      "aux.ttl.title": "会话缓存存活",
+      "aux.ttl.desc": "主会话热缓存与前缀快照的存活时间。",
+      "aux.unit.bytes": "字节",
+      "aux.unit.tokens": "Token",
+      "aux.unit.sec": "秒",
+      "aux.num.placeholder": "默认 {def}",
+      "aux.num.invalid": "请输入 0 到 {max} 的整数",
+      "aux.invalidFooter": "有 {n} 项数值无效，修正后才能保存"
     },
     en: {
       "page.title": "Antigravity2API \u00b7 Prompt Sanitizer",
@@ -166,7 +232,60 @@
       "sync.same": "Already matches the latest Antigravity Tools rules ({n} rules). Nothing to save.",
       "sync.stale": "Settings changed while fetching. Your edits were kept and the fetched rules were not applied.",
       "sync.fail": "Failed to fetch Antigravity Tools rules: {err} (you can use \"Restore built-in\")",
-      "sync.unknownErr": "Unknown error"
+      "sync.unknownErr": "Unknown error",
+      "sec.aux": "Auxiliary request routing",
+      "aux.defaults": "Restore defaults",
+      "aux.defaultsConfirm": "Confirm restore?",
+      "aux.defaultsTip": "Restores only Auxiliary request routing to its defaults. Sanitizer switches and rewrite rules are untouched.",
+      "aux.off.title": "Cache-affinity master switch is off. Auxiliary routing is inactive.",
+      "aux.off.provider": "Set by the preserve_cache_effort switch in the Provider dialog. Turn it back on in Provider settings.",
+      "aux.off.plugin": "Set by preserve_cache_effort in the plugin options (plugins.json). Change it under Plugins → Options.",
+      "aux.off.static": "Comes from the plugin's built-in static defaults and is not managed by a Provider.",
+      "aux.policy.title": "Incompatible auxiliary policy",
+      "aux.policy.desc": "How auxiliary requests (e.g. memory extraction, titles) whose prefix is incompatible with the main session cache are handled.",
+      "aux.policy.keep": "Keep",
+      "aux.policy.current_low": "Current Low",
+      "aux.policy.fallback_model": "Fallback",
+      "aux.model.title": "Fallback model",
+      "aux.model.desc": "Low-cost model that auxiliary requests are switched to when the policy is Fallback. Candidates come from the live model catalog.",
+      "aux.model.choose": "Choose a model…",
+      "aux.model.notFound": "{id} (not in current catalog)",
+      "aux.model.unset": "No fallback model chosen yet. Requests are handled as Current Low at runtime.",
+      "aux.model.missing": "The saved model is not in the current catalog. Requests are handled as Current Low at runtime.",
+      "aux.model.empty": "The model catalog is empty, so no models are available to choose.",
+      "aux.model.loadFailed": "Could not load the model catalog: {err}",
+      "aux.model.ambiguous": "Multiple login scopes detected, so the model catalog cannot be determined. Requests are handled as Current Low at runtime.",
+      "aux.model.refresh": "Refresh model catalog",
+      "aux.refreshFailed": "Could not refresh the model catalog: {err}",
+      "aux.effort.title": "Fallback effort",
+      "aux.effort.desc": "Reasoning effort used with the fallback model. Only levels supported by the chosen model are listed.",
+      "aux.effort.fixed": "Effort is fixed by the model alias: {effort}",
+      "aux.effort.none": "No reasoning · stripped automatically",
+      "aux.effort.default": "default",
+      "aux.effort.switched": "The selected model does not support {from}; switched to {to}",
+      "aux.effort.adapt": "Saved effort {from} is not supported by the selected model; it will be adapted to {to} at runtime",
+      "aux.effort.auto": "No model chosen, or it is not in the current catalog. The effort is adapted to the target model at runtime.",
+      "effort.minimal": "Minimal",
+      "effort.low": "Low",
+      "effort.medium": "Medium",
+      "effort.high": "High",
+      "effort.xhigh": "XHigh",
+      "effort.max": "Max",
+      "aux.adv.title": "Advanced",
+      "aux.adv.default": "Default",
+      "aux.adv.changed": "{n} changed",
+      "aux.minBody.title": "Minimum body size",
+      "aux.minBody.desc": "Minimum request body size for the structural heuristic to treat a request as auxiliary. Smaller bodies are ignored.",
+      "aux.maxOut.title": "Max output tokens",
+      "aux.maxOut.desc": "Maximum output token cap for the structural heuristic to treat a request as auxiliary.",
+      "aux.ttl.title": "Session cache lifetime",
+      "aux.ttl.desc": "How long the main-session hot cache and prefix snapshots are kept.",
+      "aux.unit.bytes": "bytes",
+      "aux.unit.tokens": "tokens",
+      "aux.unit.sec": "s",
+      "aux.num.placeholder": "Default {def}",
+      "aux.num.invalid": "Enter an integer from 0 to {max}",
+      "aux.invalidFooter": "{n} invalid value(s). Fix them to save."
     }
   };
 
@@ -192,6 +311,15 @@
   var loadingOpts = false;
   var idSeq = 0;
   var els = {};
+
+  // Live aux-routing catalog / master switch (GET api/aux-routing/state). Never part of draft or dirty.
+  var auxState = { loaded: false, preserveCacheEffort: true, preserveSource: "default", catalogStatus: "ok", catalogError: "", models: [] };
+  var auxSeq = 0;           // latest request wins
+  var auxRefreshing = false;
+  var auxEffortNote = null; // { key, vars } set only by a user-driven model switch
+  var auxArmed = false;
+  var auxTimer = 0;
+  var auxAdvOpen = false;
 
   /* ------------------------------------------------------------------ *
    * Helpers
@@ -226,6 +354,105 @@
   function pick(obj, a, b) {
     if (obj[a] !== undefined && obj[a] !== null) return obj[a];
     return obj[b];
+  }
+
+  /* aux_* readers mirror lib/aux-router.mjs readOptionValue: snake_case first, then camelCase,
+     each only winning when it coerces to a valid value. */
+  function pickCoerced(o, snake, camel, coerce, fallback) {
+    if (Object.prototype.hasOwnProperty.call(o, snake)) {
+      var a = coerce(o[snake]);
+      if (a !== undefined) return a;
+    }
+    if (Object.prototype.hasOwnProperty.call(o, camel)) {
+      var b = coerce(o[camel]);
+      if (b !== undefined) return b;
+    }
+    return fallback;
+  }
+
+  function coercePolicy(v) {
+    if (typeof v !== "string") return undefined;
+    var s = v.trim().toLowerCase();
+    return AUX_POLICIES.indexOf(s) >= 0 ? s : undefined;
+  }
+
+  function coerceEffort(v) {
+    if (typeof v !== "string") return undefined;
+    var s = v.trim().toLowerCase().replace(/^thinking_level_/, "");
+    return AUX_EFFORTS.indexOf(s) >= 0 ? s : undefined;
+  }
+
+  function coerceModelId(v) { return typeof v === "string" ? v.trim() : undefined; }
+
+  function stripZeros(s) { return s.replace(/^0+(?=\d)/, ""); }
+
+  /** Matches lib/aux-router.mjs tryCoerceNonNegNum so CLI values like "1e3" or 1.5 load losslessly. */
+  function coerceNonNegNum(v) {
+    if (typeof v === "number") return Number.isFinite(v) && v >= 0 ? String(v) : undefined;
+    if (typeof v === "string" && v.trim()) {
+      var n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? String(n) : undefined;
+    }
+    return undefined;
+  }
+
+  function defaultAux() {
+    return {
+      policy: "current_low",
+      fallbackModel: "",
+      fallbackEffort: "low",
+      minBodyBytes: AUX_NUM[0].def,
+      maxOutputTokens: AUX_NUM[1].def,
+      sessionTtlSec: AUX_NUM[2].def
+    };
+  }
+
+  function normAux(o) {
+    var a = defaultAux();
+    a.policy = pickCoerced(o, "aux_incompatible_policy", "auxIncompatiblePolicy", coercePolicy, a.policy);
+    a.fallbackModel = pickCoerced(o, "aux_fallback_model", "auxFallbackModel", coerceModelId, a.fallbackModel);
+    a.fallbackEffort = pickCoerced(o, "aux_fallback_effort", "auxFallbackEffort", coerceEffort, a.fallbackEffort);
+    for (var i = 0; i < AUX_NUM.length; i++) {
+      var d = AUX_NUM[i];
+      a[d.key] = pickCoerced(o, d.snake, d.camel, coerceNonNegNum, d.def);
+    }
+    return a;
+  }
+
+  /** Numeric aux field is valid when empty (= default), an untouched valid CLI number, or digits-only <= max. */
+  function auxNumValid(d, value) {
+    var v = String(value).trim();
+    if (v === "") return true;
+    if (saved && saved.aux && v === saved.aux[d.key] && coerceNonNegNum(v) !== undefined) return true;
+    if (!/^\d+$/.test(v)) return false;
+    v = stripZeros(v);
+    if (v.length !== d.max.length) return v.length < d.max.length;
+    return v <= d.max;
+  }
+
+  function auxNumCanon(d, value) {
+    var v = String(value).trim();
+    if (v === "") return d.def;
+    if (/^\d+$/.test(v)) return stripZeros(v);
+    var c = coerceNonNegNum(v);
+    return c !== undefined ? c : String(value);
+  }
+
+  function auxInvalidCount() {
+    var n = 0;
+    if (!draft) return 0;
+    for (var i = 0; i < AUX_NUM.length; i++) if (!auxNumValid(AUX_NUM[i], draft.aux[AUX_NUM[i].key])) n++;
+    return n;
+  }
+
+  function auxChangedCount() {
+    var n = 0;
+    for (var i = 0; i < AUX_NUM.length; i++) {
+      var d = AUX_NUM[i];
+      var v = draft.aux[d.key];
+      if (!auxNumValid(d, v) || auxNumCanon(d, v) !== d.def) n++;
+    }
+    return n;
   }
 
   function normScope(s) {
@@ -284,7 +511,8 @@
         sideload_mode: normSideload(pick(rw, "sideload_mode", "sideloadMode")),
         sanitize_tools_description: coerceBool(pick(rw, "sanitize_tools_description", "sanitizeToolsDescription"), true),
         rules: rules
-      }
+      },
+      aux: normAux(o)
     };
   }
 
@@ -297,11 +525,25 @@
         sideload_mode: s.promptRewrite.sideload_mode,
         sanitize_tools_description: s.promptRewrite.sanitize_tools_description,
         rules: s.promptRewrite.rules.map(cloneRule)
+      },
+      aux: {
+        policy: s.aux.policy,
+        fallbackModel: s.aux.fallbackModel,
+        fallbackEffort: s.aux.fallbackEffort,
+        minBodyBytes: s.aux.minBodyBytes,
+        maxOutputTokens: s.aux.maxOutputTokens,
+        sessionTtlSec: s.aux.sessionTtlSec
       }
     };
   }
 
-  function stateKey(s) { return JSON.stringify(s); }
+  /** Dirty key: an empty numeric aux field is the same as its default. */
+  function stateKey(s) {
+    var c = cloneState(s);
+    for (var i = 0; i < AUX_NUM.length; i++) c.aux[AUX_NUM[i].key] = auxNumCanon(AUX_NUM[i], c.aux[AUX_NUM[i].key]);
+    c.aux.fallbackModel = c.aux.fallbackModel.trim();
+    return JSON.stringify(c);
+  }
 
   function isDirty() { return stateKey(draft) !== stateKey(saved); }
 
@@ -340,6 +582,8 @@
       var k = keys[i];
       // legacy aliases are normalized into the canonical keys below
       if (k === "prompt_sanitizer" || k === "prompt_rewrite") continue;
+      // aux_* keys (snake + camel) are rewritten below as the single canonical camelCase set
+      if (AUX_KEYS.indexOf(k) >= 0) continue;
       out[k] = baseOptions[k];
     }
     out.promptSanitizer = draft.promptSanitizer;
@@ -358,6 +602,12 @@
     rw.sanitize_tools_description = draft.promptRewrite.sanitize_tools_description;
     rw.rules = draft.promptRewrite.rules.map(cloneRule);
     out.promptRewrite = rw;
+    out.auxIncompatiblePolicy = draft.aux.policy;
+    out.auxFallbackModel = draft.aux.fallbackModel.trim();
+    out.auxFallbackEffort = draft.aux.fallbackEffort;
+    out.auxMinBodyBytes = Number(auxNumCanon(AUX_NUM[0], draft.aux.minBodyBytes));
+    out.auxMaxOutputTokens = Number(auxNumCanon(AUX_NUM[1], draft.aux.maxOutputTokens));
+    out.auxSessionTtlSec = Number(auxNumCanon(AUX_NUM[2], draft.aux.sessionTtlSec));
     return out;
   }
 
@@ -537,15 +787,16 @@
 
   function renderFooter() {
     var dirty = isDirty();
+    var auxBad = auxInvalidCount();
     els.dirty.hidden = !dirty;
-    els.save.disabled = !dirty || saving;
     els.save.textContent = saving ? t("foot.saving") : t("foot.save");
     els.revert.disabled = !dirty || saving;
-    els.save.disabled = !dirty || saving || syncing || loadError;
+    els.save.disabled = !dirty || saving || syncing || loadError || auxBad > 0;
     // a failed settings read stays visible until it succeeds; transient messages take precedence
-    var key = statusKey || (loadError ? "foot.loadFailed" : "");
-    var kind = statusKey ? statusKind : (loadError ? "err" : "");
-    els.status.textContent = key ? t(key, statusVars) : "";
+    var key = statusKey || (loadError ? "foot.loadFailed" : (auxBad ? "aux.invalidFooter" : ""));
+    var kind = statusKey ? statusKind : (loadError ? "err" : (auxBad ? "warn" : ""));
+    var vars = statusKey ? statusVars : (auxBad ? { n: auxBad } : null);
+    els.status.textContent = key ? t(key, vars) : "";
     els.status.className = "status" + (kind ? " " + kind : "");
     els.retry.hidden = !loadError;
     els.retry.disabled = loadingOpts;
@@ -692,9 +943,342 @@
     renderStatic();
     renderToggles();
     renderSummary();
+    renderAux();
     renderRules();
     renderFooter();
     syncAllSegs();
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Auxiliary request routing
+   * ------------------------------------------------------------------ */
+  function clearNode(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+
+  function effortLabel(e) {
+    var k = "effort." + e;
+    var v = t(k);
+    return v === k ? e : v;
+  }
+
+  function auxOption(value, text, selected) {
+    var o = document.createElement("option");
+    o.value = value;
+    o.textContent = text;
+    if (selected) o.selected = true;
+    return o;
+  }
+
+  function auxModelById(id) {
+    if (!id) return null;
+    for (var i = 0; i < auxState.models.length; i++) if (auxState.models[i].id === id) return auxState.models[i];
+    return null;
+  }
+
+  function auxDefaultEffort(m) {
+    return m.defaultEffort && m.effectiveEfforts.indexOf(m.defaultEffort) >= 0 ? m.defaultEffort : m.effectiveEfforts[0];
+  }
+
+  /** Master-switch banner lives outside #aux-body so it stays fully opaque. */
+  function renderAuxBanner() {
+    var off = auxState.preserveCacheEffort === false;
+    els.auxOff.hidden = !off;
+    if (off) {
+      var src = auxState.preserveSource;
+      els.auxOffSrc.textContent = t(src === "provider_ui" ? "aux.off.provider" : (src === "plugins_json" ? "aux.off.plugin" : "aux.off.static"));
+    }
+    els.auxBody.classList.toggle("inactive", off);
+    els.auxAdv.classList.toggle("inactive", off);
+  }
+
+  function renderAuxModel() {
+    var a = draft.aux;
+    var show = a.policy === "fallback_model";
+    els.rowAuxModel.hidden = !show;
+    els.rowAuxEffort.hidden = !show;
+
+    var cur = a.fallbackModel;
+    var m = auxModelById(cur);
+    var sel = els.selAuxModel;
+    clearNode(sel);
+    sel.appendChild(auxOption("", t("aux.model.choose"), !cur));
+    if (cur && !m) sel.appendChild(auxOption(cur, auxState.loaded ? t("aux.model.notFound", { id: cur }) : cur, true));
+    for (var i = 0; i < auxState.models.length; i++) {
+      var mm = auxState.models[i];
+      sel.appendChild(auxOption(mm.id, mm.name === mm.id ? mm.id : mm.name + " \u00b7 " + mm.id, mm.id === cur));
+    }
+    sel.value = cur;
+    var shown = cur ? (m ? (m.name === m.id ? m.id : m.name + " \u00b7 " + m.id) : (auxState.loaded ? t("aux.model.notFound", { id: cur }) : cur)) : t("aux.model.choose");
+    sel.title = shown;
+
+    var status = auxState.catalogStatus;
+    var warn = "";
+    if (show && auxState.loaded && !m) {
+      if (status === "auth_scope_ambiguous") warn = t("aux.model.ambiguous");
+      else if (status === "error") warn = t("aux.model.loadFailed", { err: auxState.catalogError || t("sync.unknownErr") });
+      else if (status === "empty") warn = t("aux.model.empty");
+      else warn = cur ? t("aux.model.missing") : t("aux.model.unset");
+    } else if (show && !cur) {
+      warn = t("aux.model.unset");
+    }
+    els.auxModelWarn.textContent = warn;
+    els.auxModelWarn.hidden = !warn;
+
+    var hosted = window.__magpieServiceHosted === true;
+    els.auxRefresh.disabled = !hosted || auxRefreshing;
+    els.auxRefresh.title = hosted ? t("aux.model.refresh") : t("rules.syncUnavailable");
+    els.auxRefresh.setAttribute("aria-label", t("aux.model.refresh"));
+    els.auxRefresh.setAttribute("aria-busy", auxRefreshing ? "true" : "false");
+  }
+
+  function renderAuxEffort() {
+    var a = draft.aux;
+    var sel = els.selAuxEffort;
+    clearNode(sel);
+    var cur = a.fallbackEffort;
+    var m = auxModelById(a.fallbackModel);
+    var note = "";
+    var disabled = false;
+    if (m && m.isAliasFixed) {
+      var fx = m.fixedEffort || "default";
+      sel.appendChild(auxOption(fx, fx, true));
+      disabled = true;
+      note = t("aux.effort.fixed", { effort: fx });
+    } else if (m && m.effectiveEfforts.length === 0) {
+      sel.appendChild(auxOption("", t("aux.effort.none"), true));
+      disabled = true;
+    } else {
+      var list = m ? m.effectiveEfforts : AUX_EFFORTS;
+      if (list.indexOf(cur) < 0) {
+        sel.appendChild(auxOption(cur, effortLabel(cur), true));
+        note = t("aux.effort.adapt", { from: effortLabel(cur), to: effortLabel(auxDefaultEffort(m)) });
+      }
+      for (var i = 0; i < list.length; i++) sel.appendChild(auxOption(list[i], effortLabel(list[i]), list[i] === cur));
+      if (!m) note = t("aux.effort.auto");
+    }
+    if (auxEffortNote) note = t("aux.effort.switched", { from: effortLabel(auxEffortNote.from), to: effortLabel(auxEffortNote.to) });
+    sel.disabled = disabled;
+    if (!disabled) sel.value = cur;
+    var chosen = null;
+    var kids = sel.children || [];
+    for (var j = 0; j < kids.length; j++) if (kids[j].selected) chosen = kids[j];
+    sel.title = chosen ? chosen.textContent : "";
+    els.auxEffortNote.textContent = note;
+    els.auxEffortNote.hidden = !note;
+  }
+
+  function renderAuxNum() {
+    var invalid = 0;
+    for (var i = 0; i < els.auxNum.length; i++) {
+      var n = els.auxNum[i];
+      var v = draft.aux[n.def.key];
+      var ok = auxNumValid(n.def, v);
+      if (n.input.value !== v) n.input.value = v;
+      n.input.placeholder = t("aux.num.placeholder", { def: n.def.def });
+      n.input.setAttribute("aria-invalid", ok ? "false" : "true");
+      n.row.classList.toggle("invalid", !ok);
+      n.warn.textContent = ok ? "" : t("aux.num.invalid", { max: n.def.max });
+      n.warn.hidden = ok;
+      if (!ok) invalid++;
+    }
+    var changed = auxChangedCount();
+    els.auxAdvCount.textContent = changed ? t("aux.adv.changed", { n: changed }) : t("aux.adv.default");
+    els.auxAdvCount.classList.toggle("warn", invalid > 0);
+    if (invalid > 0) auxAdvOpen = true;   // never leave an invalid value hidden behind a collapsed fold
+    renderAuxAdv();
+  }
+
+  function renderAuxAdv() {
+    els.auxAdvToggle.setAttribute("aria-expanded", auxAdvOpen ? "true" : "false");
+    els.auxAdv.hidden = !auxAdvOpen;
+  }
+
+  function renderAuxDefaults() {
+    els.auxDefaults.textContent = auxArmed ? t("aux.defaultsConfirm") : t("aux.defaults");
+    els.auxDefaults.title = t("aux.defaultsTip");
+    els.auxDefaults.classList.toggle("armed", auxArmed);
+  }
+
+  function renderAux() {
+    if (!draft) return;
+    setSegValue(els.swAuxPolicy, draft.aux.policy);
+    renderAuxBanner();
+    renderAuxModel();
+    renderAuxEffort();
+    renderAuxNum();
+    renderAuxDefaults();
+    syncAllSegs();
+  }
+
+  function disarmAux() {
+    if (auxTimer) { clearTimeout(auxTimer); auxTimer = 0; }
+    if (auxArmed) {
+      auxArmed = false;
+      renderAuxDefaults();
+    }
+  }
+
+  function auxEdited() {
+    afterEdit();
+    renderAux();
+  }
+
+  function onAuxPolicy(val) {
+    var v = coercePolicy(val);
+    if (!v) return;
+    disarmReset();
+    draft.aux.policy = v;
+    auxEffortNote = null;
+    auxEdited();
+  }
+
+  function onAuxModelChange() {
+    disarmReset();
+    var a = draft.aux;
+    var prev = a.fallbackEffort;
+    a.fallbackModel = els.selAuxModel.value;
+    auxEffortNote = null;
+    var m = auxModelById(a.fallbackModel);
+    // only a user-driven model switch may move the saved effort
+    if (m && !m.isAliasFixed && m.effectiveEfforts.length > 0 && m.effectiveEfforts.indexOf(prev) < 0) {
+      var to = auxDefaultEffort(m);
+      a.fallbackEffort = to;
+      auxEffortNote = { from: prev, to: to };
+    }
+    auxEdited();
+  }
+
+  function onAuxEffortChange() {
+    if (els.selAuxEffort.disabled) return;
+    var v = coerceEffort(els.selAuxEffort.value);
+    if (!v) return;
+    disarmReset();
+    draft.aux.fallbackEffort = v;
+    auxEffortNote = null;
+    auxEdited();
+  }
+
+  function onAuxNumInput(d, input) {
+    disarmReset();
+    draft.aux[d.key] = input.value;
+    afterEdit();
+    renderAuxNum();
+  }
+
+  /** Blur / change: empty becomes the default, digits drop leading zeros; invalid text stays visible. */
+  function onAuxNumCommit(d, input) {
+    var v = String(draft.aux[d.key]).trim();
+    if (v === "") v = d.def;
+    else if (/^\d+$/.test(v)) v = stripZeros(v);
+    else v = draft.aux[d.key];
+    if (v !== draft.aux[d.key]) {
+      draft.aux[d.key] = v;
+      afterEdit();
+    }
+    renderAuxNum();
+  }
+
+  function onAuxDefaults() {
+    var was = auxArmed;
+    disarmReset();
+    if (!was) {
+      auxArmed = true;
+      renderAuxDefaults();
+      auxTimer = setTimeout(function () {
+        auxTimer = 0;
+        auxArmed = false;
+        renderAuxDefaults();
+      }, 4000);
+      return;
+    }
+    draft.aux = defaultAux();
+    auxEffortNote = null;
+    auxEdited();
+  }
+
+  function onAuxAdvToggle() {
+    disarmReset();
+    if (auxAdvOpen && auxInvalidCount() > 0) return;
+    auxAdvOpen = !auxAdvOpen;
+    renderAuxAdv();
+  }
+
+  function parseAuxState(r) {
+    var data = r && r.data;
+    if (!r || !r.res || !r.res.ok || !isObj(data) || data.ok !== true) {
+      throw new Error(isObj(data) && typeof data.error === "string" && data.error ? data.error : "HTTP " + (r && r.res ? r.res.status : 0));
+    }
+    var models = [];
+    var raw = Array.isArray(data.models) ? data.models : [];
+    for (var i = 0; i < raw.length; i++) {
+      var m = raw[i];
+      if (!isObj(m) || typeof m.id !== "string" || !m.id) continue;
+      var fixed = m.isAliasFixed === true;
+      var efforts = [];
+      var src = Array.isArray(m.effectiveEfforts) ? m.effectiveEfforts : [];
+      for (var j = 0; j < src.length; j++) {
+        var e = fixed ? (typeof src[j] === "string" ? src[j] : "") : coerceEffort(src[j]);
+        if (e && efforts.indexOf(e) < 0) efforts.push(e);
+      }
+      models.push({
+        id: m.id,
+        name: typeof m.name === "string" && m.name ? m.name : m.id,
+        effectiveEfforts: efforts,
+        defaultEffort: typeof m.defaultEffort === "string" ? m.defaultEffort : "",
+        isAliasFixed: fixed,
+        fixedEffort: typeof m.fixedEffort === "string" ? m.fixedEffort : ""
+      });
+    }
+    var status = data.catalogStatus;
+    if (status !== "ok" && status !== "empty" && status !== "auth_scope_ambiguous" && status !== "error") status = "error";
+    var src2 = data.preserveSource;
+    if (src2 !== "provider_ui" && src2 !== "plugins_json") src2 = "default";
+    return {
+      loaded: true,
+      preserveCacheEffort: data.preserveCacheEffort !== false,
+      preserveSource: src2,
+      catalogStatus: status,
+      catalogError: typeof data.catalogError === "string" ? data.catalogError : "",
+      models: models
+    };
+  }
+
+  /**
+   * Fetch api/aux-routing/state. Never touches draft/saved, so it can never make the page dirty.
+   * mode: "init" | "refresh" (?refresh=1, user initiated) | "silent" (visibility).
+   */
+  function loadAuxState(mode) {
+    if (window.__magpieServiceHosted !== true) return Promise.resolve();
+    var seq = ++auxSeq;
+    var force = mode === "refresh";
+    if (force) {
+      auxRefreshing = true;
+      if (draft) renderAuxModel();
+    }
+    function request() { return fetchAuxOnce(force); }
+    return request().then(function (r) {
+      if (isWakeEligibleFailure(r, null)) return wakeServiceAndRetry(new Error("HTTP " + r.res.status), request);
+      return r;
+    }, function (err) {
+      return wakeServiceAndRetry(err, request);
+    }).then(function (r) {
+      var next = parseAuxState(r);
+      if (seq !== auxSeq) return;
+      auxState = next;
+      if (draft) { renderAuxBanner(); renderAuxModel(); renderAuxEffort(); }
+    }).catch(function (err) {
+      if (seq !== auxSeq) return;
+      if (mode === "init") {
+        auxState = { loaded: true, preserveCacheEffort: true, preserveSource: "default", catalogStatus: "error", catalogError: syncErrText(err), models: [] };
+        if (draft) { renderAuxBanner(); renderAuxModel(); renderAuxEffort(); }
+      } else if (mode === "refresh") {
+        setStatus("aux.refreshFailed", "err", true, { err: syncErrText(err) });
+      }
+    }).then(function () {
+      if (force) {
+        auxRefreshing = false;
+        if (draft) renderAuxModel();
+      }
+    });
   }
 
   /** Reveal the app, then measure thumbs once layout exists. */
@@ -731,6 +1315,7 @@
 
   function disarmReset() {
     disarmSync();
+    disarmAux();
     if (resetTimer) { clearTimeout(resetTimer); resetTimer = 0; }
     if (resetArmed) {
       resetArmed = false;
@@ -846,6 +1431,7 @@
   function onReset() {
     if (!resetArmed) {
       disarmSync();
+      disarmAux();
       resetArmed = true;
       renderSummary();
       resetTimer = setTimeout(function () {
@@ -941,7 +1527,7 @@
     });
   }
 
-  function wakeServiceAndRetryPresets(originalErr) {
+  function wakeServiceAndRetry(originalErr, retryFn) {
     var deadlineMs = Date.now() + 8000;
     return Promise.resolve().then(function () {
       return fetch("./", { method: "GET", credentials: "omit", cache: "no-store" });
@@ -953,8 +1539,31 @@
       return waitForServiceHealthy(deadlineMs, 250);
     }).then(function (healthy) {
       if (!healthy) throw (originalErr || new Error("HTTP 502"));
-      return fetchPresetsOnce();
+      return retryFn();
     });
+  }
+
+  function wakeServiceAndRetryPresets(originalErr) {
+    return wakeServiceAndRetry(originalErr, fetchPresetsOnce);
+  }
+
+  function fetchAuxOnce(forceRefresh) {
+    try {
+      return Promise.resolve(fetch("api/aux-routing/state" + (forceRefresh ? "?refresh=1" : ""), {
+        method: "GET",
+        credentials: "omit",
+        cache: "no-store",
+        headers: { accept: "application/json" },
+      })).then(function (res) {
+        return res.json().then(function (data) {
+          return { res: res, data: data, jsonOk: true };
+        }, function () {
+          return { res: res, data: null, jsonOk: false };
+        });
+      });
+    } catch (e) {
+      return Promise.reject(e);
+    }
   }
 
   function onSync() {
@@ -1019,8 +1628,10 @@
     if (saving || !isDirty()) return;
     disarmReset();
     draft = cloneState(saved);
+    auxEffortNote = null;
     renderToggles();
     renderSummary();
+    renderAux();
     renderRules();
     setStatus("foot.reverted", "", true);
   }
@@ -1037,7 +1648,7 @@
   }
 
   function onSave() {
-    if (saving || loadError || !isDirty()) return;
+    if (saving || loadError || !isDirty() || auxInvalidCount() > 0) return;
     disarmReset();
     saving = true;
     setStatus("", "");
@@ -1059,6 +1670,7 @@
       var current = stateKey(draft);
       if (current === stateKey(snapshot)) draft = cloneState(saved);
       saving = false;
+      renderAux();
       setStatus("foot.saved", "ok", true);
     }).catch(function (err) {
       saving = false;
@@ -1099,6 +1711,43 @@
     els.revert = $("btn-revert");
     els.retry = $("btn-retry");
     els.save = $("btn-save");
+    els.swAuxPolicy = $("sw-aux-policy");
+    els.auxOff = $("aux-off");
+    els.auxOffSrc = $("aux-off-src");
+    els.auxBody = $("aux-body");
+    els.auxAdv = $("aux-adv");
+    els.auxAdvToggle = $("aux-adv-toggle");
+    els.auxAdvCount = $("aux-adv-count");
+    els.auxDefaults = $("btn-aux-defaults");
+    els.rowAuxModel = $("row-aux-model");
+    els.rowAuxEffort = $("row-aux-effort");
+    els.selAuxModel = $("sel-aux-model");
+    els.selAuxEffort = $("sel-aux-effort");
+    els.auxModelWarn = $("aux-model-warn");
+    els.auxEffortNote = $("aux-effort-note");
+    els.auxRefresh = $("btn-aux-refresh");
+    els.auxNum = [];
+    AUX_NUM.forEach(function (d) {
+      var sfx = d.input.slice(2);   // "in-aux-min" -> "-aux-min"
+      var input = $(d.input);
+      var node = { def: d, input: input, row: $("row" + sfx), warn: $("warn" + sfx) };
+      els.auxNum.push(node);
+      input.addEventListener("input", function () { onAuxNumInput(d, input); });
+      input.addEventListener("change", function () { onAuxNumCommit(d, input); });
+      input.addEventListener("blur", function () { onAuxNumCommit(d, input); });
+    });
+
+    els.swAuxPolicy.addEventListener("click", function (ev) {
+      var opt = ev.target && ev.target.closest ? ev.target.closest(".opt") : null;
+      if (!opt || !els.swAuxPolicy.contains(opt)) return;
+      onAuxPolicy(opt.getAttribute("data-val"));
+    });
+    els.swAuxPolicy.addEventListener("keydown", segKey);
+    els.selAuxModel.addEventListener("change", onAuxModelChange);
+    els.selAuxEffort.addEventListener("change", onAuxEffortChange);
+    els.auxRefresh.addEventListener("click", function () { disarmReset(); loadAuxState("refresh"); });
+    els.auxDefaults.addEventListener("click", onAuxDefaults);
+    els.auxAdvToggle.addEventListener("click", onAuxAdvToggle);
 
     bindSegs(els.swMaster, "master");
     bindSegs(els.swIdentity, "identity");
@@ -1138,6 +1787,7 @@
       baseOptions = isObj(opts) ? opts : {};
       saved = normalize(baseOptions);
       draft = cloneState(saved);
+      auxEffortNote = null;
       renderAll();
       setStatus(edited ? "foot.reloadedDiscard" : "foot.reloaded", "ok", true);
     }, function () {
@@ -1181,12 +1831,22 @@
           });
         }
       } catch (e) { /* ignore */ }
+      try {
+        // Provider dialog may flip the master switch while this page is hidden: refresh silently on return.
+        if (typeof magpie.onVisibility === "function") {
+          magpie.onVisibility(function (visible) {
+            if (visible === false || !draft || auxRefreshing) return;
+            loadAuxState("silent");
+          });
+        }
+      } catch (e) { /* ignore */ }
       return readOptions().catch(function () { loadError = true; return {}; }).then(function (opts) {
         baseOptions = isObj(opts) ? opts : {};
         saved = normalize(baseOptions);
         draft = cloneState(saved);
         renderAll();
         showApp();
+        loadAuxState("init");
       });
     }).catch(function () {
       if (!draft) {

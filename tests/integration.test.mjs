@@ -661,6 +661,9 @@ describe("Integration: PromptSanitizer onProvider -> agy2apiFetch preserve_cache
     assert.equal(pkg.magpie?.options?.auxIncompatiblePolicy, "current_low");
     assert.equal(pkg.magpie?.options?.auxFallbackModel, "");
     assert.equal(pkg.magpie?.options?.auxFallbackEffort, "low");
+    assert.equal(pkg.magpie?.options?.auxMinBodyBytes, 32768);
+    assert.equal(pkg.magpie?.options?.auxMaxOutputTokens, 8192);
+    assert.equal(pkg.magpie?.options?.auxSessionTtlSec, 600);
 
     const relaySecret = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
     const upstreamSent = [];

@@ -2,6 +2,7 @@ import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
@@ -1054,7 +1055,17 @@ describe("startPageService & plugin wiring", () => {
         document: documentMock,
         navigator: { language: "en-US" },
         URLSearchParams,
-        fetch: fetchMock,
+        fetch: async (url, init) => {
+          // The panel loads api/aux-routing/state on init; answer it here so the
+          // upstream-preset wake/retry call-order assertions below stay exact.
+          if (String(url).startsWith("api/aux-routing/state")) {
+            return new Response(
+              JSON.stringify({ ok: true, preserveCacheEffort: true, preserveSource: "default", catalogStatus: "ok", catalogError: "", models: [] }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          }
+          return fetchMock(url, init);
+        },
         setTimeout,
         clearTimeout,
         Date,
@@ -1222,6 +1233,1017 @@ describe("startPageService & plugin wiring", () => {
     } finally {
       await svc.close();
       clearAuxRoutingDiagnostics();
+    }
+  });
+
+  it("exposes GET /api/aux-routing/state with model effectiveEfforts, ?refresh=1, empty/error/ambiguous states, and master switch sources", async () => {
+    const { clearAuxRouterState, setPluginRuntimeContext } = await import("../lib/aux-router.mjs");
+    const { clearModelCache } = await import("../lib/models.mjs");
+
+    const resetRuntime = () => {
+      clearAuxRouterState();
+      clearModelCache();
+      setPluginRuntimeContext({ directory: "", magpie: null, staticOptions: null, authScope: null });
+    };
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy2api-aux-state-"));
+    resetRuntime();
+
+    let catalogMode = "initial";
+    let catalogFetchCalls = 0;
+    const catalogFetchImpl = async (url) => {
+      const u = String(url);
+      if (u.endsWith("/api/models")) {
+        catalogFetchCalls += 1;
+        if (catalogMode === "error") {
+          return new Response("upstream error", { status: 500 });
+        }
+        if (catalogMode === "empty") {
+          return new Response(JSON.stringify({ models: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        const models = [
+          {
+            id: "gemini-3.8-flash",
+            name: "Gemini 3.8 Flash",
+            provider: "MODEL_PROVIDER_GOOGLE",
+            thinking_levels: ["low", "medium", "high"],
+            capabilities: { thinking: true },
+          },
+          {
+            id: "gpt-oss-120b",
+            name: "GPT OSS 120B",
+            provider: "MODEL_PROVIDER_OPENAI",
+            thinking_levels: ["medium"],
+            capabilities: { thinking: true },
+          },
+          {
+            id: "claude-sonnet-5-5",
+            name: "Claude Sonnet 5.5",
+            provider: "MODEL_PROVIDER_ANTHROPIC",
+            capabilities: { thinking: true },
+          },
+          {
+            id: "gemini-2.5-flash-lite",
+            name: "Gemini 2.5 Flash Lite",
+            provider: "MODEL_PROVIDER_GOOGLE",
+            capabilities: { thinking: false },
+          },
+          {
+            id: "opus-high-alias",
+            name: "Opus High Alias",
+            provider: "MODEL_PROVIDER_ANTHROPIC",
+            alias: true,
+            alias_target: "claude-opus-5-5-high",
+          },
+          {
+            id: "imagen-4",
+            name: "Imagen 4",
+            provider: "MODEL_PROVIDER_GOOGLE",
+            capabilities: { image_generation: true },
+          },
+        ];
+        if (catalogMode === "refreshed") {
+          models.push({
+            id: "gemini-4-pro",
+            name: "Gemini 4 Pro",
+            provider: "MODEL_PROVIDER_GOOGLE",
+            thinking_levels: ["low", "high", "xhigh"],
+            capabilities: { thinking: true },
+          });
+        }
+        return new Response(JSON.stringify({ models }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (u.endsWith("/api/settings")) {
+        return new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    };
+
+    const port = await allocateFreePort();
+    const authScope = { baseUrl: "http://127.0.0.1:8017", apiKey: "sk-state-test" };
+    const svc = await startPageService({
+      port,
+      authScope,
+      catalogFetchImpl,
+    });
+
+    try {
+      // 1. Method restrictions & CORS
+      const postRes = await fetch(`${svc.url}/api/aux-routing/state`, { method: "POST" });
+      assert.equal(postRes.status, 405);
+      assert.equal(postRes.headers.get("access-control-allow-origin"), "*");
+      assert.deepEqual(await postRes.json(), { ok: false, error: "Method not allowed" });
+
+      // 2. Normal catalog + default master switch + effectiveEfforts / defaultEffort rules
+      const res1 = await fetch(`${svc.url}/api/aux-routing/state`);
+      assert.equal(res1.status, 200);
+      assert.equal(res1.headers.get("access-control-allow-origin"), "*");
+      const data1 = await res1.json();
+      assert.equal(data1.ok, true);
+      assert.equal(data1.preserveCacheEffort, true);
+      assert.equal(data1.preserveSource, "default");
+      assert.equal(data1.catalogStatus, "ok");
+      assert.equal(data1.catalogError, "");
+      assert.equal(catalogFetchCalls, 1);
+
+      const byId = new Map(data1.models.map((m) => [m.id, m]));
+      assert.equal(byId.has("imagen-4"), false, "image models must be excluded");
+      assert.equal(byId.has("gemini-3.8-flash-low"), false, "synthetic effort suffixes must be excluded");
+      assert.equal(byId.has("gemini-3.8-flash-high"), false, "synthetic effort suffixes must be excluded");
+
+      assert.deepEqual(byId.get("gemini-3.8-flash"), {
+        id: "gemini-3.8-flash",
+        name: "Gemini 3.8 Flash",
+        thinkingLevels: ["low", "medium", "high"],
+        effectiveEfforts: ["low", "medium", "high"],
+        defaultEffort: "low",
+        supportsReasoning: true,
+        isAliasFixed: false,
+        fixedEffort: "",
+      });
+      assert.deepEqual(byId.get("gpt-oss-120b"), {
+        id: "gpt-oss-120b",
+        name: "GPT OSS 120B",
+        thinkingLevels: ["medium"],
+        effectiveEfforts: ["medium"],
+        defaultEffort: "medium",
+        supportsReasoning: true,
+        isAliasFixed: false,
+        fixedEffort: "",
+      });
+      assert.deepEqual(byId.get("claude-sonnet-5-5"), {
+        id: "claude-sonnet-5-5",
+        name: "Claude Sonnet 5.5",
+        thinkingLevels: [],
+        effectiveEfforts: ["minimal", "low", "medium", "high"],
+        defaultEffort: "low",
+        supportsReasoning: true,
+        isAliasFixed: false,
+        fixedEffort: "",
+      });
+      assert.deepEqual(byId.get("gemini-2.5-flash-lite"), {
+        id: "gemini-2.5-flash-lite",
+        name: "Gemini 2.5 Flash Lite",
+        thinkingLevels: [],
+        effectiveEfforts: [],
+        defaultEffort: "",
+        supportsReasoning: false,
+        isAliasFixed: false,
+        fixedEffort: "",
+      });
+      assert.deepEqual(byId.get("opus-high-alias"), {
+        id: "opus-high-alias",
+        name: "Opus High Alias",
+        thinkingLevels: [],
+        effectiveEfforts: ["high"],
+        defaultEffort: "high",
+        supportsReasoning: true,
+        isAliasFixed: true,
+        fixedEffort: "high",
+      });
+
+      // 3. Cached read without ?refresh=1 does not re-fetch; ?refresh=1 forces re-fetch
+      catalogMode = "refreshed";
+      const resCached = await fetch(`${svc.url}/api/aux-routing/state`);
+      const dataCached = await resCached.json();
+      assert.equal(catalogFetchCalls, 1);
+      assert.equal(dataCached.models.some((m) => m.id === "gemini-4-pro"), false);
+
+      const resRefreshed = await fetch(`${svc.url}/api/aux-routing/state?refresh=1`);
+      const dataRefreshed = await resRefreshed.json();
+      assert.equal(catalogFetchCalls, 2);
+      assert.equal(dataRefreshed.catalogStatus, "ok");
+      assert.equal(dataRefreshed.models.some((m) => m.id === "gemini-4-pro"), true);
+
+      // 3b. Explicit ?refresh=1 when upstream fails MUST report catalogStatus: "error" (never mask failure with stale cache)
+      catalogMode = "error";
+      const resRefreshFail = await fetch(`${svc.url}/api/aux-routing/state?refresh=1`);
+      const dataRefreshFail = await resRefreshFail.json();
+      assert.equal(dataRefreshFail.catalogStatus, "error");
+      assert.deepEqual(dataRefreshFail.models, []);
+
+      // 4. Empty catalog -> catalogStatus: "empty"
+      clearModelCache();
+      catalogMode = "empty";
+      const resEmpty = await fetch(`${svc.url}/api/aux-routing/state`);
+      const dataEmpty = await resEmpty.json();
+      assert.equal(dataEmpty.ok, true);
+      assert.equal(dataEmpty.catalogStatus, "empty");
+      assert.deepEqual(dataEmpty.models, []);
+
+      // 5. Uncached fetch failure -> catalogStatus: "error"
+      clearModelCache();
+      catalogMode = "error";
+      const resErr = await fetch(`${svc.url}/api/aux-routing/state`);
+      const dataErr = await resErr.json();
+      assert.equal(dataErr.ok, true);
+      assert.equal(dataErr.catalogStatus, "error");
+      assert.ok(dataErr.catalogError.length > 0);
+      assert.deepEqual(dataErr.models, []);
+
+      // 6. Master switch source checks: plugins.json, settings.json (provider_ui), magpie.options, staticOptions
+      clearModelCache();
+      catalogMode = "empty";
+      fs.writeFileSync(
+        path.join(tmpDir, "plugins.json"),
+        JSON.stringify({
+          plugins: [{ spec: "magpie-agy2api-plugin", options: { preserveCacheEffort: false } }],
+        }),
+      );
+      setPluginRuntimeContext({
+        directory: tmpDir,
+        magpie: { options: async () => ({ preserve_cache_effort: true }) },
+      });
+      const resPlugins = await fetch(`${svc.url}/api/aux-routing/state`);
+      const dataPlugins = await resPlugins.json();
+      assert.equal(dataPlugins.preserveCacheEffort, false);
+      assert.equal(dataPlugins.preserveSource, "plugins_json");
+
+      // settings.json without explicit preserve_cache_effort must NOT let magpie.options mask plugins.json
+      fs.writeFileSync(path.join(tmpDir, "settings.json"), JSON.stringify({ pluginOptions: {} }));
+      const resSettingsEmpty = await fetch(`${svc.url}/api/aux-routing/state`);
+      const dataSettingsEmpty = await resSettingsEmpty.json();
+      assert.equal(dataSettingsEmpty.preserveCacheEffort, false);
+      assert.equal(dataSettingsEmpty.preserveSource, "plugins_json");
+
+      // settings.json with explicit pluginOptions.agy2api.preserve_cache_effort: true -> provider_ui overrides plugins.json
+      fs.writeFileSync(
+        path.join(tmpDir, "settings.json"),
+        JSON.stringify({ pluginOptions: { agy2api: { preserve_cache_effort: true } } }),
+      );
+      const resProviderUi = await fetch(`${svc.url}/api/aux-routing/state`);
+      const dataProviderUi = await resProviderUi.json();
+      assert.equal(dataProviderUi.preserveCacheEffort, true);
+      assert.equal(dataProviderUi.preserveSource, "provider_ui");
+
+      // Without settings.json or plugins.json: magpie.options("agy2api") -> provider_ui; staticOptions -> plugins_json
+      clearAuxRouterState();
+      fs.rmSync(path.join(tmpDir, "settings.json"), { force: true });
+      fs.rmSync(path.join(tmpDir, "plugins.json"), { force: true });
+      setPluginRuntimeContext({
+        directory: tmpDir,
+        magpie: { options: async () => ({ preserve_cache_effort: false }) },
+        staticOptions: { preserveCacheEffort: true },
+      });
+      const resMagpieUi = await fetch(`${svc.url}/api/aux-routing/state`);
+      const dataMagpieUi = await resMagpieUi.json();
+      assert.equal(dataMagpieUi.preserveCacheEffort, false);
+      assert.equal(dataMagpieUi.preserveSource, "provider_ui");
+
+      setPluginRuntimeContext({
+        directory: tmpDir,
+        magpie: null,
+        staticOptions: { preserveCacheEffort: false },
+      });
+      const resStatic = await fetch(`${svc.url}/api/aux-routing/state`);
+      const dataStatic = await resStatic.json();
+      assert.equal(dataStatic.preserveCacheEffort, false);
+      assert.equal(dataStatic.preserveSource, "plugins_json");
+
+      // 7. Ambiguous auth scope (both explicit null and multi-login plugin-auth.json) never probes upstream
+      const callsBeforeAmbiguous = catalogFetchCalls;
+      await startPageService({ port, authScope: null, catalogFetchImpl });
+      const resAmbig1 = await fetch(`${svc.url}/api/aux-routing/state`);
+      const dataAmbig1 = await resAmbig1.json();
+      assert.equal(dataAmbig1.ok, true);
+      assert.equal(dataAmbig1.catalogStatus, "auth_scope_ambiguous");
+      assert.equal(dataAmbig1.catalogError, "");
+      assert.deepEqual(dataAmbig1.models, []);
+      assert.equal(catalogFetchCalls, callsBeforeAmbiguous);
+
+      // Multi-login plugin-auth.json via getRegisteredAuthScope()
+      fs.writeFileSync(
+        path.join(tmpDir, "plugin-auth.json"),
+        JSON.stringify({
+          "agy2api#a": { key: "sk-a", baseUrl: "http://127.0.0.1:8017" },
+          "agy2api#b": { key: "sk-b", baseUrl: "http://127.0.0.1:8018" },
+        }),
+      );
+      setPluginRuntimeContext({ directory: tmpDir, magpie: null, staticOptions: null });
+      await startPageService({ port, catalogFetchImpl });
+      const resAmbig2 = await fetch(`${svc.url}/api/aux-routing/state`);
+      const dataAmbig2 = await resAmbig2.json();
+      assert.equal(dataAmbig2.ok, true);
+      assert.equal(dataAmbig2.catalogStatus, "auth_scope_ambiguous");
+      assert.deepEqual(dataAmbig2.models, []);
+      assert.equal(catalogFetchCalls, callsBeforeAmbiguous);
+    } finally {
+      await svc.close();
+      resetRuntime();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  /* ------------------------------------------------------------------ *
+   * Auxiliary request routing section of ui/sanitizer-panel.{html,js}
+   * Zero-dependency lightweight DOM parser + VM harness (runs everywhere).
+   * ------------------------------------------------------------------ */
+  const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+
+  function createMiniDom(htmlSource) {
+    const byId = new Map();
+    class MiniEvent {
+      constructor(type, init = {}) {
+        this.type = String(type);
+        this.bubbles = Boolean(init.bubbles);
+        this.target = null;
+        this.defaultPrevented = false;
+      }
+      preventDefault() {
+        this.defaultPrevented = true;
+      }
+    }
+
+    function makeNode(tag) {
+      const listeners = {};
+      const classes = new Set();
+      let explicitValue;
+      const node = {
+        nodeType: tag === "#text" ? 3 : tag === "#fragment" ? 11 : 1,
+        tagName: String(tag).toUpperCase(),
+        id: "",
+        title: "",
+        placeholder: "",
+        disabled: false,
+        hidden: false,
+        selected: false,
+        tabIndex: 0,
+        type: "",
+        style: {},
+        attributes: {},
+        children: [],
+        parentNode: null,
+        _text: "",
+        get className() {
+          return Array.from(classes).join(" ");
+        },
+        set className(v) {
+          classes.clear();
+          String(v || "").split(/\s+/).filter(Boolean).forEach((c) => classes.add(c));
+        },
+        classList: {
+          add(...cs) { cs.filter(Boolean).forEach((c) => classes.add(c)); },
+          remove(...cs) { cs.forEach((c) => classes.delete(c)); },
+          toggle(c, force) {
+            const on = force === undefined ? !classes.has(c) : Boolean(force);
+            if (on) classes.add(c);
+            else classes.delete(c);
+            return on;
+          },
+          contains(c) { return classes.has(c); },
+        },
+        get textContent() {
+          if (this.nodeType === 3) return this._text;
+          return this.children.map((c) => c.textContent).join("");
+        },
+        set textContent(v) {
+          this.children.length = 0;
+          this._text = String(v ?? "");
+          if (this.nodeType !== 3 && this._text) {
+            const t = makeNode("#text");
+            t._text = this._text;
+            t.parentNode = this;
+            this.children.push(t);
+          }
+        },
+        get options() {
+          return this.tagName === "SELECT" ? this.children.filter((c) => c.tagName === "OPTION") : [];
+        },
+        get value() {
+          if (this.tagName === "SELECT") {
+            const opts = this.options;
+            if (explicitValue !== undefined && opts.some((o) => o.value === explicitValue)) {
+              return explicitValue;
+            }
+            const sel = opts.find((o) => o.selected) || opts[0];
+            return sel ? sel.value : "";
+          }
+          return explicitValue !== undefined ? explicitValue : (this.attributes.value ?? "");
+        },
+        set value(v) {
+          const sv = String(v ?? "");
+          if (this.tagName === "SELECT") {
+            const opts = this.options;
+            if (opts.some((o) => o.value === sv)) {
+              explicitValue = sv;
+              opts.forEach((o) => { o.selected = o.value === sv; });
+            } else {
+              explicitValue = undefined;
+            }
+          } else {
+            explicitValue = sv;
+          }
+        },
+        setAttribute(k, v) {
+          const sv = String(v);
+          this.attributes[k] = sv;
+          if (k === "id") {
+            this.id = sv;
+            byId.set(sv, this);
+          } else if (k === "class") {
+            this.className = sv;
+          } else if (k === "hidden") {
+            this.hidden = true;
+          } else if (k === "disabled") {
+            this.disabled = true;
+          } else if (k === "title") {
+            this.title = sv;
+          } else if (k === "value") {
+            explicitValue = sv;
+          }
+        },
+        getAttribute(k) {
+          return Object.prototype.hasOwnProperty.call(this.attributes, k) ? this.attributes[k] : null;
+        },
+        appendChild(child) {
+          if (!child) return child;
+          if (child.nodeType === 11) {
+            for (const sub of [...child.children]) this.appendChild(sub);
+            child.children.length = 0;
+            return child;
+          }
+          if (child.parentNode && child.parentNode.children) {
+            const i = child.parentNode.children.indexOf(child);
+            if (i >= 0) child.parentNode.children.splice(i, 1);
+          }
+          child.parentNode = this;
+          this.children.push(child);
+          if (this.tagName === "SELECT" && child.tagName === "OPTION" && child.selected) {
+            explicitValue = child.value;
+          }
+          return child;
+        },
+        removeChild(child) {
+          const i = this.children.indexOf(child);
+          if (i >= 0) {
+            this.children.splice(i, 1);
+            child.parentNode = null;
+          }
+          return child;
+        },
+        get firstChild() { return this.children[0] || null; },
+        get lastChild() { return this.children[this.children.length - 1] || null; },
+        contains(other) {
+          let cur = other;
+          while (cur) {
+            if (cur === this) return true;
+            cur = cur.parentNode;
+          }
+          return false;
+        },
+        matches(sel) {
+          if (this.nodeType !== 1) return false;
+          const s = sel.trim();
+          const mOpt = s.match(/^\.([A-Za-z0-9_-]+)\[([A-Za-z0-9_-]+)="([^"]*)"\]$/);
+          if (mOpt) return classes.has(mOpt[1]) && this.getAttribute(mOpt[2]) === mOpt[3];
+          const mAttr = s.match(/^\[([A-Za-z0-9_-]+)(?:="([^"]*)")?\]$/);
+          if (mAttr) {
+            if (mAttr[2] === undefined) return this.getAttribute(mAttr[1]) !== null;
+            return this.getAttribute(mAttr[1]) === mAttr[2];
+          }
+          if (s.startsWith("#")) return this.id === s.slice(1);
+          if (s.startsWith(".")) return s.slice(1).split(".").every((c) => classes.has(c));
+          return this.tagName === s.toUpperCase();
+        },
+        closest(sel) {
+          let cur = this;
+          while (cur && cur.nodeType === 1) {
+            if (cur.matches(sel)) return cur;
+            cur = cur.parentNode;
+          }
+          return null;
+        },
+        querySelectorAll(sel) {
+          const parts = sel.split(",").map((x) => x.trim()).filter(Boolean);
+          const out = [];
+          const walk = (n) => {
+            for (const c of n.children || []) {
+              if (c.nodeType === 1 && parts.some((p) => c.matches(p))) out.push(c);
+              walk(c);
+            }
+          };
+          walk(this);
+          return out;
+        },
+        querySelector(sel) {
+          return this.querySelectorAll(sel)[0] || null;
+        },
+        addEventListener(type, fn) {
+          listeners[type] = listeners[type] || [];
+          listeners[type].push(fn);
+        },
+        dispatchEvent(ev) {
+          if (!ev.target) ev.target = this;
+          let cur = this;
+          while (cur) {
+            for (const fn of [...(cur._listeners?.[ev.type] || [])]) {
+              fn.call(cur, ev);
+            }
+            if (!ev.bubbles) break;
+            cur = cur.parentNode;
+          }
+          return !ev.defaultPrevented;
+        },
+        click() {
+          if (this.disabled) return;
+          this.dispatchEvent(new MiniEvent("click", { bubbles: true }));
+        },
+        focus() {},
+        scrollIntoView() {},
+        _listeners: listeners,
+      };
+      return node;
+    }
+
+    const root = makeNode("document");
+    const stack = [root];
+    const tokenRe = /<!--[\s\S]*?-->|<\/([A-Za-z0-9:-]+)\s*>|<([A-Za-z0-9:-]+)((?:\s+[A-Za-z0-9_:-]+(?:="[^"]*"|='[^']*'|[^\s>]*))*\s*)\/?>|([^<]+)/g;
+    let m;
+    while ((m = tokenRe.exec(htmlSource)) !== null) {
+      if (m[1]) {
+        const closeTag = m[1].toUpperCase();
+        for (let i = stack.length - 1; i > 0; i--) {
+          if (stack[i].tagName === closeTag) {
+            stack.length = i;
+            break;
+          }
+        }
+      } else if (m[2]) {
+        const tag = m[2].toLowerCase();
+        if (tag === "!doctype") continue;
+        const el = makeNode(tag);
+        const attrRaw = m[3] || "";
+        const attrRe = /([A-Za-z0-9_:-]+)(?:="([^"]*)"|='([^']*)'|=([^\s>]+))?/g;
+        let am;
+        while ((am = attrRe.exec(attrRaw)) !== null) {
+          const val = am[2] ?? am[3] ?? am[4] ?? "";
+          el.setAttribute(am[1], val);
+        }
+        stack[stack.length - 1].appendChild(el);
+        const selfClose = m[0].endsWith("/>") || VOID_TAGS.has(tag);
+        if (!selfClose) stack.push(el);
+      } else if (m[4] && m[4].trim()) {
+        const t = makeNode("#text");
+        t._text = m[4];
+        stack[stack.length - 1].appendChild(t);
+      }
+    }
+
+    const docEl = root.querySelector("html") || makeNode("html");
+    const docListeners = {};
+    const doc = {
+      readyState: "complete",
+      documentElement: docEl,
+      title: "",
+      getElementById(id) { return byId.get(id) || null; },
+      createElement(tag) { return makeNode(tag); },
+      createElementNS(_ns, tag) { return makeNode(tag); },
+      createDocumentFragment() { return makeNode("#fragment"); },
+      createTextNode(text) { const t = makeNode("#text"); t._text = String(text ?? ""); return t; },
+      querySelector(sel) { return root.querySelector(sel); },
+      querySelectorAll(sel) { return root.querySelectorAll(sel); },
+      addEventListener(type, fn) {
+        docListeners[type] = docListeners[type] || [];
+        docListeners[type].push(fn);
+      },
+    };
+    const winListeners = {};
+    const win = {
+      document: doc,
+      Event: MiniEvent,
+      location: { search: "", href: "http://127.0.0.1:18417/", replace() {} },
+      navigator: { language: "en-US" },
+      addEventListener(type, fn) {
+        winListeners[type] = winListeners[type] || [];
+        winListeners[type].push(fn);
+      },
+      close() {},
+    };
+    win.window = win;
+    win.parent = win;
+    return { win, doc };
+  }
+
+  const AUX_MODELS = [
+    { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash", thinkingLevels: ["low", "medium", "high"], effectiveEfforts: ["low", "medium", "high"], defaultEffort: "low", supportsReasoning: true, isAliasFixed: false, fixedEffort: "" },
+    { id: "gpt-oss-120b", name: "GPT OSS 120B", thinkingLevels: ["medium"], effectiveEfforts: ["medium"], defaultEffort: "medium", supportsReasoning: true, isAliasFixed: false, fixedEffort: "" },
+    { id: "claude-fixed-high", name: "claude-fixed-high", thinkingLevels: [], effectiveEfforts: ["high"], defaultEffort: "high", supportsReasoning: true, isAliasFixed: true, fixedEffort: "high" },
+    { id: "plain-text-model", name: "Plain Text Model", thinkingLevels: [], effectiveEfforts: [], defaultEffort: "", supportsReasoning: false, isAliasFixed: false, fixedEffort: "" },
+  ];
+
+  function auxStatePayload(over = {}) {
+    return { ok: true, preserveCacheEffort: true, preserveSource: "default", catalogStatus: "ok", catalogError: "", models: AUX_MODELS, ...over };
+  }
+
+  async function mountAuxPanel({ options = {}, state = auxStatePayload(), fetchImpl = null, hosted = true } = {}) {
+    const html = fs.readFileSync(path.join(PLUGIN_ROOT, "ui/sanitizer-panel.html"), "utf8");
+    const jsSource = fs.readFileSync(path.join(PLUGIN_ROOT, "ui/sanitizer-panel.js"), "utf8");
+    const { win, doc } = createMiniDom(html);
+    const ctl = { state, calls: [], setCalls: [], visCbs: [] };
+    const fetchFn = async (url, init) => {
+      const u = String(url);
+      ctl.calls.push(u);
+      if (fetchImpl) {
+        const custom = await fetchImpl(u, init, ctl);
+        if (custom) return custom;
+      }
+      if (u.startsWith("api/aux-routing/state")) {
+        return new Response(JSON.stringify(ctl.state), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      throw new Error(`Unexpected fetch ${u}`);
+    };
+    win.fetch = fetchFn;
+    if (hosted) win.__magpieServiceHosted = true;
+    win.magpie = {
+      ready: Promise.resolve({ lang: "en" }),
+      options: {
+        get: async () => JSON.parse(JSON.stringify(options)),
+        set: async (payload) => {
+          ctl.setCalls.push(JSON.parse(JSON.stringify(payload)));
+          return payload;
+        },
+      },
+      onTheme() {},
+      onVisibility(fn) { ctl.visCbs.push(fn); },
+    };
+    const sandbox = {
+      window: win,
+      document: doc,
+      navigator: win.navigator,
+      URLSearchParams,
+      fetch: fetchFn,
+      setTimeout,
+      clearTimeout,
+      Date,
+      Promise,
+      Error,
+      Math,
+      Object,
+      Array,
+      String,
+      Boolean,
+      Number,
+      JSON,
+      RegExp,
+      parseInt,
+      isNaN,
+    };
+    vm.runInNewContext(jsSource, sandbox);
+    const settle = (ms = 60) => new Promise((r) => setTimeout(r, ms));
+    await settle();
+    const $ = (id) => doc.getElementById(id);
+    return {
+      win, doc, ctl, $, settle,
+      fire(el, type) { el.dispatchEvent(new win.Event(type, { bubbles: true })); },
+      type(el, value) { el.value = value; el.dispatchEvent(new win.Event("input", { bubbles: true })); },
+      choose(sel, value) { sel.value = value; sel.dispatchEvent(new win.Event("change", { bubbles: true })); },
+      seg(id, val) { $(id).querySelector(`.opt[data-val="${val}"]`).click(); },
+      optionTexts: (sel) => Array.from(sel.options).map((o) => o.textContent),
+      optionValues: (sel) => Array.from(sel.options).map((o) => o.value),
+      close() { win.close(); },
+    };
+  }
+
+  it("aux panel: reads CLI snake_case aux_* options (snake wins, invalid falls through) with a clean initial state", async () => {
+    const p = await mountAuxPanel({
+      options: {
+        aux_incompatible_policy: "fallback_model",
+        auxIncompatiblePolicy: "keep",
+        aux_fallback_model: "gemini-3.8-flash",
+        aux_fallback_effort: "THINKING_LEVEL_MEDIUM",
+        aux_min_body_bytes: "abc",
+        auxMinBodyBytes: "1e3",
+        aux_max_output_tokens: 1000,
+        auxMaxOutputTokens: 2000,
+        aux_session_ttl_sec: "300",
+        preserveCacheEffort: true,
+        pageServicePort: 18417,
+      },
+    });
+    try {
+      assert.deepEqual(p.ctl.calls, ["api/aux-routing/state"]);
+      assert.equal(p.$("sw-aux-policy").getAttribute("data-val"), "fallback_model");
+      assert.equal(p.$("row-aux-model").hidden, false);
+      assert.equal(p.$("row-aux-effort").hidden, false);
+      assert.equal(p.$("sel-aux-model").value, "gemini-3.8-flash");
+      assert.equal(p.$("sel-aux-effort").value, "medium");
+      assert.equal(p.$("in-aux-min").value, "1000");
+      assert.equal(p.$("in-aux-out").value, "1000");
+      assert.equal(p.$("in-aux-ttl").value, "300");
+      assert.equal(p.$("aux-adv-count").textContent, "3 changed");
+      assert.equal(p.$("btn-save").disabled, true);
+      assert.equal(p.$("dirty").hidden, true);
+      assert.equal(p.$("aux-adv").hidden, true);
+      assert.equal(p.$("aux-adv-toggle").getAttribute("aria-expanded"), "false");
+      assert.equal(p.ctl.setCalls.length, 0);
+      // model labels: name + id when they differ, bare id otherwise
+      assert.deepEqual(p.optionTexts(p.$("sel-aux-model")).slice(0, 3), ["Choose a model…", "Gemini 3.8 Flash · gemini-3.8-flash", "GPT OSS 120B · gpt-oss-120b"]);
+      assert.ok(p.optionTexts(p.$("sel-aux-model")).includes("claude-fixed-high"));
+      assert.equal(p.$("sel-aux-model").title, "Gemini 3.8 Flash · gemini-3.8-flash");
+    } finally {
+      p.close();
+    }
+  });
+
+  it("aux panel: defaults, fallback visibility, and effort follow the model only on user model change", async () => {
+    const p = await mountAuxPanel({ options: {} });
+    try {
+      assert.equal(p.$("sw-aux-policy").getAttribute("data-val"), "current_low");
+      assert.equal(p.$("row-aux-model").hidden, true);
+      assert.equal(p.$("row-aux-effort").hidden, true);
+      assert.equal(p.$("aux-adv-count").textContent, "Default");
+      assert.equal(p.$("in-aux-min").placeholder, "Default 32768");
+
+      p.seg("sw-aux-policy", "fallback_model");
+      assert.equal(p.$("row-aux-model").hidden, false);
+      assert.equal(p.$("btn-save").disabled, false);
+      // unset model: gentle warning, saving stays possible
+      assert.match(p.$("aux-model-warn").textContent, /No fallback model chosen/);
+      assert.equal(p.$("aux-model-warn").hidden, false);
+      assert.equal(p.$("btn-save").disabled, false);
+      // no model selected: standard levels, enabled
+      assert.deepEqual(p.optionValues(p.$("sel-aux-effort")), ["minimal", "low", "medium", "high", "xhigh", "max"]);
+      assert.equal(p.$("sel-aux-effort").disabled, false);
+      assert.equal(p.$("sel-aux-effort").value, "low");
+
+      // single-level model: low -> medium with a note
+      p.choose(p.$("sel-aux-model"), "gpt-oss-120b");
+      assert.deepEqual(p.optionValues(p.$("sel-aux-effort")), ["medium"]);
+      assert.equal(p.$("sel-aux-effort").value, "medium");
+      assert.equal(p.$("sel-aux-effort").disabled, false);
+      assert.equal(p.$("aux-effort-note").textContent, "The selected model does not support Low; switched to Medium");
+      assert.equal(p.$("aux-model-warn").hidden, true);
+
+      // medium is supported by gemini: unchanged
+      p.choose(p.$("sel-aux-model"), "gemini-3.8-flash");
+      assert.deepEqual(p.optionValues(p.$("sel-aux-effort")), ["low", "medium", "high"]);
+      assert.equal(p.$("sel-aux-effort").value, "medium");
+      assert.equal(p.$("aux-effort-note").hidden, true);
+
+      // alias-fixed model: locked, draft untouched
+      p.choose(p.$("sel-aux-model"), "claude-fixed-high");
+      assert.equal(p.$("sel-aux-effort").disabled, true);
+      assert.deepEqual(p.optionValues(p.$("sel-aux-effort")), ["high"]);
+      assert.equal(p.$("aux-effort-note").textContent, "Effort is fixed by the model alias: high");
+
+      // non-thinking model: disabled, draft untouched
+      p.choose(p.$("sel-aux-model"), "plain-text-model");
+      assert.equal(p.$("sel-aux-effort").disabled, true);
+      assert.equal(p.optionTexts(p.$("sel-aux-effort"))[0], "No reasoning · stripped automatically");
+
+      // back to a thinking model keeps the (still valid) saved effort
+      p.choose(p.$("sel-aux-model"), "gemini-3.8-flash");
+      p.$("btn-save").click();
+      await p.settle();
+      assert.equal(p.ctl.setCalls.length, 1);
+      assert.equal(p.ctl.setCalls[0].auxFallbackModel, "gemini-3.8-flash");
+      assert.equal(p.ctl.setCalls[0].auxFallbackEffort, "medium");
+      assert.equal(p.ctl.setCalls[0].auxIncompatiblePolicy, "fallback_model");
+    } finally {
+      p.close();
+    }
+  });
+
+  it("aux panel: refresh and visibility re-reads never change the draft; saved unknown model is kept with a catalog-aware warning", async () => {
+    const p = await mountAuxPanel({
+      options: { auxIncompatiblePolicy: "fallback_model", auxFallbackModel: "gpt-oss-120b", auxFallbackEffort: "low" },
+    });
+    try {
+      // saved effort "low" is not supported by gpt-oss-120b: kept, with a runtime-adapt hint, not dirty
+      assert.equal(p.$("sel-aux-effort").value, "low");
+      assert.match(p.$("aux-effort-note").textContent, /will be adapted to Medium at runtime/);
+      assert.equal(p.$("dirty").hidden, true);
+
+      // catalog now lacks the saved model
+      p.ctl.state = auxStatePayload({ models: AUX_MODELS.filter((m) => m.id !== "gpt-oss-120b") });
+      p.$("btn-aux-refresh").click();
+      await p.settle();
+      assert.equal(p.ctl.calls.at(-1), "api/aux-routing/state?refresh=1");
+      assert.equal(p.$("sel-aux-model").value, "gpt-oss-120b");
+      assert.equal(p.optionTexts(p.$("sel-aux-model"))[1], "gpt-oss-120b (not in current catalog)");
+      assert.match(p.$("aux-model-warn").textContent, /saved model is not in the current catalog/);
+      assert.equal(p.$("dirty").hidden, true);
+      assert.equal(p.$("btn-save").disabled, true);
+
+      for (const [status, extra, re] of [
+        ["error", { catalogError: "boom" }, /Could not load the model catalog: boom/],
+        ["empty", {}, /model catalog is empty/],
+        ["auth_scope_ambiguous", {}, /Multiple login scopes/],
+      ]) {
+        p.ctl.state = auxStatePayload({ catalogStatus: status, models: [], ...extra });
+        p.$("btn-aux-refresh").click();
+        await p.settle();
+        assert.match(p.$("aux-model-warn").textContent, re);
+        assert.equal(p.$("sel-aux-model").value, "gpt-oss-120b");
+        assert.equal(p.$("dirty").hidden, true);
+      }
+      assert.equal(p.ctl.setCalls.length, 0);
+    } finally {
+      p.close();
+    }
+  });
+
+  it("aux panel: master switch off shows the source-specific banner, dims the body, and refreshes silently on visibility", async () => {
+    const p = await mountAuxPanel({
+      options: { aux_min_body_bytes: 1024 },
+      state: auxStatePayload({ preserveCacheEffort: false, preserveSource: "provider_ui" }),
+    });
+    try {
+      assert.equal(p.$("aux-off").hidden, false);
+      assert.match(p.$("aux-off-src").textContent, /Provider dialog/);
+      assert.equal(p.$("aux-body").classList.contains("inactive"), true);
+      assert.equal(p.$("aux-adv").classList.contains("inactive"), true);
+      // the banner is outside the dimmed body so it stays crisp
+      assert.equal(p.$("aux-body").contains(p.$("aux-off")), false);
+      // still editable while inactive
+      p.type(p.$("in-aux-ttl"), "120");
+      assert.equal(p.$("dirty").hidden, false);
+      p.$("btn-revert").click();
+      assert.equal(p.$("in-aux-ttl").value, "600");
+
+      p.ctl.state = auxStatePayload({ preserveCacheEffort: false, preserveSource: "plugins_json" });
+      p.ctl.visCbs.forEach((fn) => fn(true));
+      await p.settle();
+      assert.match(p.$("aux-off-src").textContent, /plugins\.json/);
+      p.ctl.state = auxStatePayload({ preserveCacheEffort: false, preserveSource: "default" });
+      p.ctl.visCbs.forEach((fn) => fn(true));
+      await p.settle();
+      assert.match(p.$("aux-off-src").textContent, /not managed by a Provider/);
+
+      // flipped back on in the Provider dialog: banner clears with no dirty state or draft change
+      p.type(p.$("in-aux-min"), "2048");
+      p.ctl.state = auxStatePayload({ preserveCacheEffort: true, preserveSource: "provider_ui" });
+      p.ctl.visCbs.forEach((fn) => fn(true));
+      await p.settle();
+      assert.equal(p.$("aux-off").hidden, true);
+      assert.equal(p.$("aux-body").classList.contains("inactive"), false);
+      assert.equal(p.$("in-aux-min").value, "2048");
+      assert.deepEqual(p.ctl.calls.filter((u) => u.includes("refresh")), []);
+      p.ctl.visCbs.forEach((fn) => fn(false));
+      await p.settle();
+      // init + three visible events fetched; the hidden event must not
+      assert.equal(p.ctl.calls.length, 4);
+    } finally {
+      p.close();
+    }
+  });
+
+  it("aux panel: invalid numbers block save, valid edits save canonical camelCase only, and rules actions never touch aux", async () => {
+    const customRule = { id: "keep-me", pattern: "foo", replacement: "bar", scope: "all", enabled: true };
+    const p = await mountAuxPanel({
+      options: {
+        promptSanitizer: true,
+        promptRewrite: { enabled: true, normalize_identity: true, sideload_mode: "off", sanitize_tools_description: true, rules: [customRule] },
+        aux_incompatible_policy: "current_low",
+        auxIncompatiblePolicy: "keep",
+        aux_fallback_model: "gemini-3.8-flash",
+        aux_fallback_effort: "high",
+        aux_min_body_bytes: 65536,
+        auxMaxOutputTokens: 4096,
+        aux_session_ttl_sec: 300,
+        preserve_cache_effort: false,
+        pageServicePort: 18417,
+        cacheTtlSec: 10,
+      },
+      fetchImpl: async (u) =>
+        u === "api/upstream-presets"
+          ? new Response(JSON.stringify({ ok: true, rules: [{ id: "up", pattern: "abc", replacement: "", scope: "all", enabled: true }] }), { status: 200, headers: { "content-type": "application/json" } })
+          : null,
+    });
+    try {
+      const save = p.$("btn-save");
+      const row = p.$("row-aux-min");
+      // advanced section is collapsed; an invalid edit must surface it
+      p.$("aux-adv-toggle").click();
+      assert.equal(p.$("aux-adv").hidden, false);
+      p.$("aux-adv-toggle").click();
+      assert.equal(p.$("aux-adv").hidden, true);
+
+      for (const bad of ["-5", "1.5", "abc", "6291457", "1e3"]) {
+        p.type(p.$("in-aux-min"), bad);
+        assert.equal(row.classList.contains("invalid"), true, bad);
+        assert.equal(p.$("warn-aux-min").textContent, "Enter an integer from 0 to 6291456");
+        assert.equal(p.$("aux-adv").hidden, false);
+        assert.equal(save.disabled, true, bad);
+        assert.equal(p.$("status").textContent, "1 invalid value(s). Fix them to save.");
+        p.$("aux-adv-toggle").click();   // cannot hide an invalid value
+        assert.equal(p.$("aux-adv").hidden, false);
+      }
+      // empty means default (valid, dirty vs 65536); typing a valid integer is saveable
+      p.type(p.$("in-aux-min"), "");
+      assert.equal(row.classList.contains("invalid"), false);
+      assert.equal(save.disabled, false);
+      // whitespace-only input saved WITHOUT blur resolves cleanly to numeric default (never NaN/null)
+      p.type(p.$("in-aux-out"), "   ");
+      assert.equal(save.disabled, false);
+      save.click();
+      await p.settle();
+      assert.strictEqual(p.ctl.setCalls.at(-1).auxMaxOutputTokens, 8192);
+      p.type(p.$("in-aux-out"), "4096");
+
+      p.type(p.$("in-aux-min"), "00131072");
+      p.fire(p.$("in-aux-min"), "blur");
+      assert.equal(p.$("in-aux-min").value, "131072");
+      p.seg("sw-aux-policy", "keep");
+      assert.equal(save.disabled, false);
+
+      // rules actions leave aux untouched
+      const auxSnapshot = () => ["in-aux-min", "in-aux-out", "in-aux-ttl"].map((id) => p.$(id).value).concat(p.$("sw-aux-policy").getAttribute("data-val"), p.$("sel-aux-effort").value);
+      const before = auxSnapshot();
+      p.$("btn-reset").click();
+      p.$("btn-reset").click();
+      assert.equal(p.$("rules-list").querySelectorAll(".row.rule").length, RECOMMENDED_PRESET_RULES.length);
+      assert.deepEqual(auxSnapshot(), before);
+      p.$("btn-sync-upstream").click();
+      p.$("btn-sync-upstream").click();
+      await p.settle(120);
+      assert.equal(p.$("rules-list").querySelectorAll(".row.rule").length, 1);
+      assert.deepEqual(auxSnapshot(), before);
+
+      save.click();
+      await p.settle();
+      assert.equal(p.ctl.setCalls.length, 2);
+      const out = p.ctl.setCalls[1];
+      for (const k of ["aux_incompatible_policy", "aux_fallback_model", "aux_fallback_effort", "aux_min_body_bytes", "aux_max_output_tokens", "aux_session_ttl_sec"]) {
+        assert.equal(k in out, false, k);
+      }
+      assert.equal(out.auxIncompatiblePolicy, "keep");
+      assert.equal(out.auxFallbackModel, "gemini-3.8-flash");
+      assert.equal(out.auxFallbackEffort, "high");
+      assert.strictEqual(out.auxMinBodyBytes, 131072);
+      assert.strictEqual(out.auxMaxOutputTokens, 4096);
+      assert.strictEqual(out.auxSessionTtlSec, 300);
+      // unrelated keys, including the master switch, are carried over verbatim
+      assert.strictEqual(out.preserve_cache_effort, false);
+      assert.equal("preserveCacheEffort" in out, false);
+      assert.equal(out.pageServicePort, 18417);
+      assert.equal(out.cacheTtlSec, 10);
+      assert.equal(out.promptRewrite.rules[0].id, "up");
+      assert.equal(p.$("dirty").hidden, true);
+      assert.equal(save.disabled, true);
+
+      // aux defaults: two-step, aux only
+      const rulesBefore = p.$("rules-list").querySelectorAll(".row.rule").length;
+      p.$("btn-aux-defaults").click();
+      assert.equal(p.$("btn-aux-defaults").textContent, "Confirm restore?");
+      assert.equal(p.$("in-aux-min").value, "131072");
+      p.$("btn-aux-defaults").click();
+      assert.equal(p.$("sw-aux-policy").getAttribute("data-val"), "current_low");
+      assert.deepEqual(["in-aux-min", "in-aux-out", "in-aux-ttl"].map((id) => p.$(id).value), ["32768", "8192", "600"]);
+      assert.equal(p.$("btn-aux-defaults").textContent, "Restore defaults");
+      assert.equal(p.$("aux-adv-count").textContent, "Default");
+      assert.equal(p.$("rules-list").querySelectorAll(".row.rule").length, rulesBefore);
+      assert.equal(p.$("dirty").hidden, false);
+    } finally {
+      p.close();
+    }
+  });
+
+  it("aux panel: api/aux-routing/state wakes a dormant service on non-JSON 502 and retries once", async () => {
+    let stateAttempts = 0;
+    const p = await mountAuxPanel({
+      options: {},
+      fetchImpl: async (u) => {
+        if (u === "api/aux-routing/state") {
+          stateAttempts += 1;
+          if (stateAttempts === 1) return new Response("502 Bad Gateway (dormant)", { status: 502, headers: { "content-type": "text/plain" } });
+          return null;
+        }
+        if (u === "./") return new Response("<html></html>", { status: 200 });
+        if (u === "health") return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+        return null;
+      },
+    });
+    try {
+      await p.settle(120);
+      assert.deepEqual(p.ctl.calls, ["api/aux-routing/state", "./", "health", "api/aux-routing/state"]);
+      p.seg("sw-aux-policy", "fallback_model");
+      assert.equal(p.optionValues(p.$("sel-aux-model")).includes("gpt-oss-120b"), true);
+    } finally {
+      p.close();
+    }
+  });
+
+  it("aux panel: unhosted pages never call the state API and disable catalog refresh", async () => {
+    const p = await mountAuxPanel({ options: { auxFallbackModel: "saved-model", auxIncompatiblePolicy: "fallback_model" }, hosted: false });
+    try {
+      // magpie.service is absent here, so the page stays put and uses the bridge only
+      assert.deepEqual(p.ctl.calls, []);
+      assert.equal(p.$("btn-aux-refresh").disabled, true);
+      assert.equal(p.$("btn-aux-refresh").title, "Requires Magpie page service to fetch upstream");
+      assert.equal(p.$("sel-aux-model").value, "saved-model");
+      assert.equal(p.optionTexts(p.$("sel-aux-model"))[1], "saved-model");
+    } finally {
+      p.close();
     }
   });
 });

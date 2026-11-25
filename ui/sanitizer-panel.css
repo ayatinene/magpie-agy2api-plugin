@@ -169,12 +169,44 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
 .status.ok { color: var(--green); }
 .status.err { color: var(--red); }
 
+/* ---------- auxiliary request routing ---------- */
+.list + .row-head.aux-head, #settings + .row-head.aux-head { margin-top: 14px; }
+.list + .row-head.aux-adv-head { margin-top: 8px; }
+.aux-body { transition: opacity .15s var(--ease); }
+.aux-body.inactive { opacity: .5; }
+#aux-adv > .row { transition: opacity .15s var(--ease); }
+#aux-adv.inactive { opacity: 1; }
+#aux-adv.inactive > .row { opacity: .5; }
+.aux-body > .row + .row { border-top: 1px solid var(--line-2); }
+.aux-off { background: var(--amber-soft); }
+.aux-off + .aux-body { border-top: 1px solid var(--line-2); }
+.aux-off[hidden] + .aux-body { border-top: 0; }
+.aux-adv-head .fold .label { color: var(--muted); }
+.fold .count.warn { color: var(--amber); }
+.row.pref > .ctl { flex: 0 1 auto; display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
+.pick.wide { flex: 0 1 auto; min-width: 0; }
+.pick.wide select { width: 280px; max-width: 100%; text-overflow: ellipsis; }
+.pick select:disabled { cursor: default; opacity: .6; }
+.numwrap { flex: none; display: inline-flex; align-items: center; gap: 8px; }
+.words.num { width: 96px; min-width: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.numwrap .unit { min-width: 40px; font-size: 11.5px; color: var(--muted); }
+.row.num.invalid .words.num { border-color: var(--amber); }
+.row.num .sub.warn { margin-top: 2px; }
+.status.warn { color: var(--amber); }
+.ib[aria-busy="true"] svg { animation: aux-spin .9s linear infinite; }
+@keyframes aux-spin { to { transform: rotate(360deg); } }
+
 /* ---------- narrow ---------- */
 @media (max-width: 560px) {
   .view { padding: 4px 0 0; }
   .savebar::before { inset: 0; }
   .row.pref { flex-wrap: wrap; row-gap: 6px; }
   .row.pref .who { flex: 1 1 140px; }
+  .row.pref > .segs, .row.pref > .pick, .row.pref > .numwrap { margin-left: auto; }
+  .row.pref.child .ctl { flex: 1 1 100%; padding-left: 14px; }
+  .pick.wide { flex: 1 1 auto; min-width: 0; }
+  .pick.wide select { width: 100%; max-width: none; }
+  .segs .opt { padding: 0 8px; }
   .rules-head .grow { flex-basis: 100%; height: 0; }
   
   .rules .row.rule {

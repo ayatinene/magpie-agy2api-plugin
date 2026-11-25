@@ -75,6 +75,106 @@
     </div>
   </div>
 
+  <div class="row-head aux-head">
+    <span class="label" id="aux-label" data-i18n="sec.aux"></span>
+    <span class="grow"></span>
+    <button type="button" class="text" id="btn-aux-defaults"></button>
+  </div>
+
+  <div class="list prefs" id="aux-list">
+    <div class="row pref aux-off" id="aux-off" role="status" hidden>
+      <div class="who">
+        <div class="name" data-i18n="aux.off.title"></div>
+        <div class="sub warn" id="aux-off-src"></div>
+      </div>
+    </div>
+    <div class="aux-body" id="aux-body">
+      <div class="row pref" data-i18n-title="aux.policy.desc">
+        <div class="who">
+          <div class="name" id="lbl-aux-policy" data-i18n="aux.policy.title"></div>
+          <div class="sub sr-only" data-i18n="aux.policy.desc"></div>
+        </div>
+        <div class="segs" role="radiogroup" aria-labelledby="lbl-aux-policy" id="sw-aux-policy" data-val="current_low">
+          <span class="thumb" aria-hidden="true"></span>
+          <button class="opt" type="button" role="radio" data-val="keep" aria-checked="false" data-i18n="aux.policy.keep"></button>
+          <button class="opt on" type="button" role="radio" data-val="current_low" aria-checked="true" data-i18n="aux.policy.current_low"></button>
+          <button class="opt" type="button" role="radio" data-val="fallback_model" aria-checked="false" data-i18n="aux.policy.fallback_model"></button>
+        </div>
+      </div>
+      <div class="row pref child" id="row-aux-model" hidden data-i18n-title="aux.model.desc">
+        <div class="who">
+          <div class="name" id="lbl-aux-model" data-i18n="aux.model.title"></div>
+          <div class="sub sr-only" data-i18n="aux.model.desc"></div>
+          <div class="sub warn" id="aux-model-warn" role="status" hidden></div>
+        </div>
+        <div class="ctl">
+          <label class="pick wide">
+            <select id="sel-aux-model" aria-labelledby="lbl-aux-model"></select>
+            <svg class="chev" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true" focusable="false"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </label>
+          <button type="button" class="text ib" id="btn-aux-refresh">
+            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false"><path d="M13.5 8a5.5 5.5 0 1 1-1.8-4.07M13.5 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="row pref child" id="row-aux-effort" hidden data-i18n-title="aux.effort.desc">
+        <div class="who">
+          <div class="name" id="lbl-aux-effort" data-i18n="aux.effort.title"></div>
+          <div class="sub sr-only" data-i18n="aux.effort.desc"></div>
+          <div class="sub" id="aux-effort-note" role="status" hidden></div>
+        </div>
+        <label class="pick">
+          <select id="sel-aux-effort" aria-labelledby="lbl-aux-effort"></select>
+          <svg class="chev" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true" focusable="false"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="row-head aux-adv-head">
+    <button type="button" class="fold" id="aux-adv-toggle" aria-expanded="false" aria-controls="aux-adv">
+      <span class="label" data-i18n="aux.adv.title"></span>
+      <span class="count" id="aux-adv-count"></span>
+      <svg class="chev" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true" focusable="false"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </div>
+
+  <div class="list prefs aux-body" id="aux-adv" hidden>
+    <div class="row pref num" id="row-aux-min" data-i18n-title="aux.minBody.desc">
+      <div class="who">
+        <div class="name" id="lbl-aux-min" data-i18n="aux.minBody.title"></div>
+        <div class="sub sr-only" data-i18n="aux.minBody.desc"></div>
+        <div class="sub warn" id="warn-aux-min" hidden></div>
+      </div>
+      <span class="numwrap">
+        <input class="words mono num" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" id="in-aux-min" aria-labelledby="lbl-aux-min">
+        <span class="unit" data-i18n="aux.unit.bytes"></span>
+      </span>
+    </div>
+    <div class="row pref num" id="row-aux-out" data-i18n-title="aux.maxOut.desc">
+      <div class="who">
+        <div class="name" id="lbl-aux-out" data-i18n="aux.maxOut.title"></div>
+        <div class="sub sr-only" data-i18n="aux.maxOut.desc"></div>
+        <div class="sub warn" id="warn-aux-out" hidden></div>
+      </div>
+      <span class="numwrap">
+        <input class="words mono num" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" id="in-aux-out" aria-labelledby="lbl-aux-out">
+        <span class="unit" data-i18n="aux.unit.tokens"></span>
+      </span>
+    </div>
+    <div class="row pref num" id="row-aux-ttl" data-i18n-title="aux.ttl.desc">
+      <div class="who">
+        <div class="name" id="lbl-aux-ttl" data-i18n="aux.ttl.title"></div>
+        <div class="sub sr-only" data-i18n="aux.ttl.desc"></div>
+        <div class="sub warn" id="warn-aux-ttl" hidden></div>
+      </div>
+      <span class="numwrap">
+        <input class="words mono num" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" id="in-aux-ttl" aria-labelledby="lbl-aux-ttl">
+        <span class="unit" data-i18n="aux.unit.sec"></span>
+      </span>
+    </div>
+  </div>
+
   <div class="row-head rules-head">
     <button type="button" class="fold" id="rules-toggle" aria-expanded="true" aria-controls="rules-body">
       <span class="label" id="rules-summary"></span>
