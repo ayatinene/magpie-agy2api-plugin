@@ -1289,11 +1289,12 @@ describe("quota.mjs", () => {
     assert.equal(claudeWin.used, 100);
     assert.equal(claudeWin.resetsAt, "2026-11-22T18:00:00.000Z");
 
-    // Per-account detail windows never have >1 " · " in display
+    // Per-account detail windows join all segments uniformly with " · " (no double-space workaround)
+    const accARow = usage.windows.find((w) => w.name === "Account A · PRO");
+    assert.equal(accARow.display, "部分冷却 · Gemini 80%/90% · Claude 冷却(50%/70%)");
     for (const w of usage.windows) {
       if (w.display) {
-        const count = (w.display.match(/ · /g) || []).length;
-        assert.ok(count <= 1, `Too many ' · ' in display: ${w.display}`);
+        assert.equal(w.display.includes("  "), false, `Unexpected double-space join in display: ${w.display}`);
       }
     }
   });
@@ -1415,7 +1416,7 @@ describe("quota.mjs", () => {
       "Gemini 4 Argon 7 days 80",
     ]);
     assert.equal(row(mixed, "Ultra"), "Gemini 80%/90% · Claude 100%/100%");
-    assert.equal(row(mixed, "Pro"), "Gemini 100%/60% · Claude 100%/50%  Argon 20%");
+    assert.equal(row(mixed, "Pro"), "Gemini 100%/60% · Claude 100%/50% · Argon 20%");
     // Routing still weighs both accounts: Ultra's Gemini 80% (x2.0) and Pro's Argon 20% (x1.5)
     assert.equal(modelWin(mixed, "gemini-4-argon").pool, "Gemini 4 Argon");
     assert.equal(modelWin(mixed, "gemini-4-argon").used, 46);
@@ -1536,13 +1537,13 @@ describe("quota.mjs", () => {
     assert.equal(geminiWin.used, 21);
 
     const aliceRow = usage.windows.find((w) => w.name === "Alice · FREE");
-    assert.ok(aliceRow.display.includes("共享"));
+    assert.equal(aliceRow.display, "Gemini 60%/80% · 共享");
     const carolRow = usage.windows.find((w) => w.name === "Carol · PRO");
-    assert.ok(carolRow.display.includes("家庭"));
+    assert.equal(carolRow.display, "Gemini 100%/90% · 家庭");
 
     for (const w of usage.windows) {
       if (w.display) {
-        assert.ok((w.display.match(/ · /g) || []).length <= 1);
+        assert.equal(w.display.includes("  "), false);
       }
     }
   });
